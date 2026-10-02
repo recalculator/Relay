@@ -46,7 +46,7 @@ hasn't yet run against real CloudKit. See TESTING.md.
 Never combine this with `NSPersistentCloudKitContainer` or SwiftData's CloudKit option
 for the same records.
 
-### Schema (v2)
+### Schema (v3)
 
 ```sql
 notes(
@@ -61,7 +61,15 @@ notes(
   server_system_fields BLOB    -- v2: encoded CKRecord system fields of that version
 ) STRICT
 sync_state(key TEXT PRIMARY KEY, value BLOB) STRICT   -- v2: engine state, bound account
+INDEX notes_live_by_modified ON notes(is_deleted, modified_at DESC, id)   -- v3
 ```
+
+The v3 index matches the notes-list query (`allNotes()`). Without it, SQLite sorted
+every live row, bodies included, in a temporary B-tree on each load. The list is
+reloaded after every committed change, so that cost recurred on every save. With
+10,000 synthetic notes, load time went from about 58 ms to about 21 ms. The cost is
+index maintenance on writes: saves and applied sync changes were about 5–15% slower
+(BENCHMARKS.md).
 
 **Pending work** is `local_version > synced_version`. It's written by the same SQL
 statement as the edit, so a note can't be saved without its pending marker.
@@ -69,8 +77,8 @@ statement as the edit, so a note can't be saved without its pending marker.
 describe.
 
 **Versioning:** `PRAGMA user_version` with numbered migrations. Each runs in one
-transaction with its version bump. v1→v2 is tested against a hand-built v1 file, and was
-also observed on a real Phase 1 database on this Mac. A database newer than the app is
+transaction with its version bump. v1→current is tested against a hand-built v1 file.
+v1→v2 was also observed on a real Phase 1 database on this Mac. A database newer than the app is
 refused, not opened.
 
 ### Durability: actual settings and guarantees
@@ -82,18 +90,32 @@ them back:
 |---|---|
 | `journal_mode = WAL` | Commits append to a write-ahead log. Readers don't block the writer. |
 | `synchronous = FULL` | SQLite syncs the WAL to storage at **every** commit, before COMMIT returns. |
-| `fullfsync = ON`, `checkpoint_fullfsync = ON` | On Apple platforms, plain `fsync()` doesn't ask the drive to flush its write cache. These make SQLite use `F_FULLFSYNC`, which does. It adds per-commit latency (not measured). |
+| `fullfsync = ON`, `checkpoint_fullfsync = ON` | Intended to make SQLite use `F_FULLFSYNC`, which asks the drive to flush its write cache. **Observed: the system SQLite doesn't do that per commit** (see below). |
+
+**What the flush actually is (measured 2026-10-02, macOS 26.5, system SQLite 3.51.0).**
+A dyld interposer counted the flush calls made while RelayBench ran Relay's real save
+path (`Scripts/fsync-probe.sh`). With these settings, each WAL commit issued **one
+`F_BARRIERFSYNC` and no `F_FULLFSYNC`**. No `F_FULLFSYNC` was issued anywhere in that
+run, including the WAL checkpoints when stores closed. In a plain-C control on the same
+library, `fullfsync = OFF` issued plain `fsync()` per commit instead. A raw `F_FULLFSYNC` costs about 4 ms on this Mac
+(barrier: about 0.2 ms), which matches the measured save latency (median about 0.4 ms,
+BENCHMARKS.md). `F_BARRIERFSYNC` sends the data to the drive and makes the drive keep
+write order, but it doesn't wait for the drive's volatile cache to reach permanent
+storage. iOS hasn't been checked.
 
 What a returned save therefore means:
 
 - **Atomic:** a transaction is all-or-nothing, including after a crash mid-write.
 - **Survives the app crashing or being killed:** the committed data has reached the OS
   and the file.
-- **OS crash or power loss:** SQLite has requested a full flush to storage before
-  reporting the commit. Whether the data survives depends on the OS and hardware
-  honoring that request. **This is not guaranteed unconditionally, and power loss has
-  not been tested.** `fullfsync` is confirmed set on macOS. Its effect on iOS hasn't
-  been verified.
+- **OS crash:** the commit's data was handed to the drive (barrier sync) before COMMIT
+  returned, so it should survive a kernel panic. Not tested.
+- **Power loss:** **the most recent commits may be lost**, because the drive's cache
+  isn't forced to permanent storage per commit. What the barrier does provide is write
+  ordering, so the WAL should still recover to a consistent earlier state rather than a
+  corrupted one. Power loss has not been tested. Forcing a real `F_FULLFSYNC` per save
+  would cost about 4 ms on this Mac. That's a possible change, not the current
+  behavior.
 - **Not covered:** text typed within the ~0.75 s autosave window before an abrupt
   kill, disk failure, or storage that ignores flush requests.
 
@@ -115,10 +137,33 @@ never deleted or recreated.
 - `NoteStore` and `SyncCoordinator` are **actors**. The store exclusively owns the
   non-`Sendable` SQLite connection. Store methods contain no `await`, so a transaction
   can't be interleaved by actor reentrancy.
-- `SyncCoordinator` methods do `await` the store, so engine callbacks can interleave at
-  those points. Correctness doesn't depend on that ordering: whether a server version is
-  new is decided by comparing **change tags stored in the database**, inside the
-  transaction that applies it.
+- `SyncCoordinator` methods do `await` the store, so other coordinator calls (engine
+  callbacks, `CKAccountChanged`, Sync Now, "Use This Account's Notes") can run at those
+  points. A check made before an `await` may not hold after it. Two layers handle
+  this:
+  1. **Engine lease (coordinator).** Each engine operation captures an `EngineLease`
+     when it starts: the engine, the `NoteStore` instance it syncs, and a `SyncFence`.
+     After every `await`, the operation checks the lease is still current before
+     touching `inFlight`, the engine, or the database, and stops if it isn't. Writes go
+     to `lease.store`, never to whatever `store` is by then, so an operation can't
+     follow a database replacement.
+  2. **Sync-session fence (store).** `NoteStore.beginSyncSession(owner:)` returns a fence
+     (owner account and session number) when an engine is created.
+     `endSyncSession()` runs when it's stopped. Every sync write passes the fence, and
+     the store checks it **inside the write's transaction**: wrong session or a
+     different database owner → `staleSyncOperation`, nothing written. This covers a
+     write that was already queued on the store when its engine stopped. The store
+     runs one call at a time, so a write that began before the session ended finishes
+     before any write of a later session starts.
+  Whether a server version is new is still decided by comparing **change tags stored
+  in the database**, inside the transaction that applies it.
+- Regression tests (`ReentrancyTests.swift`) suspend the coordinator at a known
+  `await` with a test-only `Checkpoint` hook. While it's suspended, they switch
+  accounts, replace the database, or run Sync Now, then resume. Before the fix, five
+  failed: a fetched batch continued into the replacement database; a stopped engine's
+  upload results were recorded, and consumed a newer engine's in-flight entry; Sync Now
+  restarted sync for the old account after an account change; a stale account check
+  replaced the fresh database's engine.
 - UI models are `@MainActor`. Only `Sendable` values (`Note`, `RemoteNote`,
   `StoreChange`, …) cross actors.
 - Store changes are published as an `AsyncStream`, only after commit. Subscribers
@@ -306,7 +351,12 @@ holds two resolutions in flight at once and checks that exactly one engine is cr
   account change. Re-checking before each fetch narrows the window: the cached identity
   is dropped on `CKAccountChanged`. But if the notification arrives late *and* the
   engine fetches before reporting, records from the new account could reach this
-  database. The docs don't say either way.
+  database. Apple's CKSyncEngine overview says only that the engine "listens for when
+  the user signs in or out" and "when it notices an account change, it sends an
+  `accountChange` event". It doesn't say how that event is ordered relative to fetched
+  changes. **Account isolation therefore depends on this unverified assumption.** The
+  simulated tests can't settle it, because `FakeSyncEngine` follows whatever ordering
+  the test chooses.
 - **`userRecordID()` offline:** whether it answers from a local cache isn't
   documented. If it doesn't, an offline launch syncs only after the backoff retry,
   foreground, or `CKAccountChanged` succeeds.
@@ -315,6 +365,11 @@ holds two resolutions in flight at once and checks that exactly one engine is cr
 - **`cancelOperations()` is not awaited** when an engine is stopped from inside its own
   callback (awaiting could deadlock). Its later events are ignored by identity, but
   whether a stopped engine keeps making network requests briefly hasn't been observed.
+- **Reentrancy is covered within the process, not across it.** The lease and fence
+  make sure Relay never writes into a database after deciding to stop syncing it. They
+  can't tell whether a record that CKSyncEngine delivers *while Relay still believes the
+  account is current* actually came from that account. The first bullet above remains
+  the open question.
 - **A stopped engine's ignored successful save** can cost a spurious conflict copy if
   the user edits the same note again before the next upload. The new engine then sees
   the server ahead of its base with different content. Both versions are kept; nothing
@@ -323,8 +378,10 @@ holds two resolutions in flight at once and checks that exactly one engine is cr
 ### Account switch and archives
 
 During a mismatch, **Use This Account's Notes…** moves the old database to
-`Application Support/Relay/Archived/` (kept, not uploaded, not deleted), opens an empty
-database bound to the current account, and creates a fresh engine with no saved state.
+`Application Support/Relay/Archived/` (kept, not uploaded, not deleted) and opens an
+empty database bound to the current account. It then resolves the account again,
+since it may have changed meanwhile. If it still matches, a fresh engine starts with
+no saved state.
 There's no UI to restore an archive. If the old account returns, its synced notes
 download again, and unsynced edits remain only in the archive file.
 

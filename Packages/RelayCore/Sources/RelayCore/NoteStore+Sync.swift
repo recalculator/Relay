@@ -36,6 +36,39 @@ extension NoteStore {
         public let conflictCopyID: UUID?
     }
 
+    // MARK: Sync sessions
+
+    /// Starts a sync session owned by `owner` and returns its fence. Any earlier session
+    /// ends. Called when the coordinator creates an engine.
+    public nonisolated func beginSyncSession(owner: String) -> SyncFence {
+        SyncFence(owner: owner, epoch: syncEpoch.withLock { epoch in
+            epoch += 1
+            return epoch
+        })
+    }
+
+    /// Ends the current sync session, so writes fenced to it are rejected from now on.
+    /// Called when the coordinator stops an engine. Synchronous, so it can run inside
+    /// that engine's own callback.
+    public nonisolated func endSyncSession() {
+        syncEpoch.withLock { $0 += 1 }
+    }
+
+    /// Throws unless `fence` belongs to the current session and the database is still
+    /// owned by the fence's account. Called first inside each fenced write transaction.
+    ///
+    /// The coordinator also checks its own state before writing, but a write is queued
+    /// on this actor and can run after the coordinator has moved on. This check runs
+    /// where the write happens. A write that started before the session ended finishes
+    /// before any write of a later session can begin, because this actor runs one call
+    /// at a time.
+    private func checkFence(_ fence: SyncFence?) throws(StoreError) {
+        guard let fence else { return }
+        guard syncEpoch.withLock({ $0 }) == fence.epoch, try boundAccount() == fence.owner else {
+            throw .staleSyncOperation
+        }
+    }
+
     // MARK: Uploads
 
     /// The data to upload for `id`, or nil if there's nothing to upload: the note is
@@ -63,8 +96,9 @@ extension NoteStore {
     ///
     /// - Returns: Whether the row still has unsynced changes.
     @discardableResult
-    public func markUploaded(_ saved: RemoteNote, sentVersion: Int64) throws(StoreError) -> Bool {
+    public func markUploaded(_ saved: RemoteNote, sentVersion: Int64, fence: SyncFence? = nil) throws(StoreError) -> Bool {
         try db.transaction { () throws(StoreError) -> Bool in
+            try checkFence(fence)
             guard let row = try fetchSyncRow(saved.id) else { return false }
             let synced = min(max(row.syncedVersion, sentVersion), row.localVersion)
 
@@ -99,7 +133,14 @@ extension NoteStore {
 
     /// Forgets the server version a row is based on (zone recreated, record missing).
     /// The next upload creates the record afresh.
-    public func clearServerMetadata(id: UUID) throws(StoreError) {
+    public func clearServerMetadata(id: UUID, fence: SyncFence? = nil) throws(StoreError) {
+        try db.transaction { () throws(StoreError) in
+            try checkFence(fence)
+            try clearServerMetadataRow(id)
+        }
+    }
+
+    private func clearServerMetadataRow(_ id: UUID) throws(StoreError) {
         try db.run(
             "UPDATE notes SET server_change_tag = NULL, server_system_fields = NULL WHERE id = ?",
             [.text(id.uuidString)]
@@ -113,12 +154,13 @@ extension NoteStore {
     /// Applying the same change twice is safe. The second time, the stored change tag
     /// matches, so it resolves to `.ignore`.
     @discardableResult
-    public func applyRemote(_ change: RemoteChange) throws(StoreError) -> ApplyResult {
+    public func applyRemote(_ change: RemoteChange, fence: SyncFence? = nil) throws(StoreError) -> ApplyResult {
         let id: UUID = switch change {
         case .modified(let note): note.id
         case .recordGone(let id): id
         }
         let result = try db.transaction { () throws(StoreError) -> ApplyResult in
+            try checkFence(fence)
             let row = try fetchSyncRow(id)
             let resolution = ConflictResolver.resolve(local: row?.resolverState, remote: change)
             var copyID: UUID?
@@ -143,7 +185,7 @@ extension NoteStore {
                     [tagValue(server), fieldsValue(server), .text(id.uuidString)]
                 )
             case (.keepLocal, .recordGone):
-                try clearServerMetadata(id: id)
+                try clearServerMetadataRow(id)
             case (.applyRemoteAndCopyLocal, .modified(let server)):
                 if let row {
                     copyID = try insertConflictCopy(of: id, title: row.note.title, body: row.note.body)
@@ -176,8 +218,9 @@ extension NoteStore {
     /// server to delete.
     ///
     /// - Returns: Ids of notes that now need uploading.
-    public func handleZoneDeleted(_ reason: ZoneDeletionReason) throws(StoreError) -> [UUID] {
+    public func handleZoneDeleted(_ reason: ZoneDeletionReason, fence: SyncFence? = nil) throws(StoreError) -> [UUID] {
         let pending = try db.transaction { () throws(StoreError) -> [UUID] in
+            try checkFence(fence)
             try db.run("DELETE FROM notes WHERE is_deleted = 1")
             switch reason {
             case .deletedOrPurged:
@@ -214,8 +257,11 @@ extension NoteStore {
         try syncStateValue(.engineState)
     }
 
-    public func saveEngineState(_ data: Data) throws(StoreError) {
-        try setSyncState(.engineState, data)
+    public func saveEngineState(_ data: Data, fence: SyncFence? = nil) throws(StoreError) {
+        try db.transaction { () throws(StoreError) in
+            try checkFence(fence)
+            try setSyncState(.engineState, data)
+        }
     }
 
     public func clearEngineState() throws(StoreError) {

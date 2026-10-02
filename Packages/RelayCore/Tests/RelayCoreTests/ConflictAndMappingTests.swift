@@ -171,6 +171,18 @@ struct SchemaTests {
         #expect(try await store.pendingChanges().map(\.localVersion) == [3])
         #expect(try await store.queryIntForTesting("PRAGMA user_version") == Int64(Schema.currentVersion))
         #expect(try await store.boundAccount() == nil)  // sync_state table exists and is empty.
+        #expect(try await store.queryIntForTesting(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'notes_live_by_modified'") == 1)
+    }
+
+    /// The notes list is reloaded after every committed change. Without the v3 index,
+    /// SQLite sorts every row (bodies included) in a temporary B-tree each time.
+    @Test func loadingTheNotesListUsesTheIndexInsteadOfSorting() async throws {
+        let directory = try TemporaryDirectory()
+        let store = try NoteStore(url: directory.storeURL)
+        let plan = try await store.queryPlanForTesting(NoteStore.allNotesQuery)
+        #expect(plan.contains { $0.contains("notes_live_by_modified") })
+        #expect(!plan.contains { $0.contains("TEMP B-TREE") })
     }
 
     @Test func durabilityPragmasAreApplied() async throws {

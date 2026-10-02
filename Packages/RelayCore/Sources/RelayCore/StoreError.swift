@@ -20,6 +20,9 @@ public enum StoreError: Error, Equatable, Sendable {
     case unsupportedSchemaVersion(found: Int, supported: Int)
     /// The store was used after `close()`.
     case closed
+    /// A sync write came from a sync session that has since ended (its engine stopped,
+    /// or the database's owner changed). It was discarded without changing anything.
+    case staleSyncOperation
 }
 
 extension StoreError: LocalizedError {
@@ -39,6 +42,8 @@ extension StoreError: LocalizedError {
             "These notes were saved by a newer version of Relay. Update the app to open them."
         case .closed:
             "The notes database is closed."
+        case .staleSyncOperation:
+            "A sync change from an earlier sync session was discarded."
         }
     }
 }

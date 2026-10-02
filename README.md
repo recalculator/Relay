@@ -26,8 +26,11 @@ Implemented, verified only against a simulated server:
   "(Conflict copy)".
 - Deletions sync as tombstones. A concurrent edit always beats a delete.
 - Account separation: the iCloud account is confirmed, and checked against the account
-  that owns the database, before sync starts. One account's notes are never uploaded
-  to another.
+  that owns the database, before sync starts and before each fetch and send. Once Relay
+  stops syncing a database, no sync write can reach it (checked inside each write's
+  transaction). Isolation still assumes CKSyncEngine reports an account change before
+  delivering the new account's records. Apple doesn't document that ordering
+  (ARCHITECTURE.md → "Remaining uncertainties").
 - A status area based on observed sync outcomes, and debug-only diagnostics
   (double-click the status area in a Debug build).
 
@@ -55,7 +58,27 @@ swift test --package-path Packages/RelayCore                                    
 xcodebuild test  -project Relay.xcodeproj -scheme Relay -destination 'platform=macOS' # same, via Xcode
 xcodebuild build -project Relay.xcodeproj -scheme Relay -destination 'platform=macOS'
 xcodebuild build -project Relay.xcodeproj -scheme Relay -destination 'generic/platform=iOS Simulator'  # needs iOS platform
+Scripts/benchmark.sh                                                                 # local benchmarks (BENCHMARKS.md)
 ```
+
+## Performance
+
+Measured locally with `RelayBench` on an Apple M5 MacBook (macOS 26.5, release build,
+**Low Power Mode on**), using synthetic notes and Relay's real storage and sync code. No
+CloudKit is involved. Medians:
+
+| | 1,000 notes | 10,000 notes |
+|---|---:|---:|
+| Save an edit (commit + pending marker) | 0.26 ms (p99 1.2 ms) | 0.47 ms (p99 2.1 ms) |
+| Reopen the store and load the notes list | 2.3 ms | 21.5 ms |
+| Search (in-memory filter, no matches) | 11 ms | 112 ms |
+| Apply 1,000 incoming changes (simulated transport) | 306 ms | 536 ms |
+| Reopen and recover 600 pending changes | 1.3 ms | 5.3 ms |
+
+A notes-list index (schema v3) cut the 10,000-note load from 58 ms to 21 ms, at the
+cost of slightly slower writes. Search scales linearly with note text and is the main
+limit at large sizes. The save numbers are for a barrier sync, not a full drive-cache
+flush (see Limitations). BENCHMARKS.md has the method, every repetition, and caveats.
 
 ## Enabling iCloud sync
 
@@ -117,8 +140,11 @@ Relay/
 - The Simulator can't receive the push notifications CKSyncEngine relies on. Use a
   real device or Mac.
 - Typing within the 0.75 s autosave window can be lost on an abrupt kill.
-  Power-loss durability depends on the OS and hardware honoring flush requests (see
-  ARCHITECTURE.md → Durability). It hasn't been tested.
+- A returned save survives the app crashing. On this Mac, the system SQLite flushes each
+  commit with `F_BARRIERFSYNC`, not `F_FULLFSYNC` (measured with
+  `Scripts/fsync-probe.sh`), so **the latest saves may be lost on power loss**. Write
+  ordering should keep the database consistent. Power loss hasn't been tested
+  (ARCHITECTURE.md → Durability).
 - The conflict policy keeps both versions. It doesn't merge text.
 - Deleted notes leave small content-free tombstone records in iCloud indefinitely.
 - After an account switch, the previous account's database is archived on the device.

@@ -153,10 +153,11 @@ final class SQLiteConnection {
     ///   the writer.
     /// - `synchronous = FULL`: SQLite syncs the WAL at every commit, rather than only at
     ///   checkpoints as with NORMAL.
-    /// - `fullfsync = ON` / `checkpoint_fullfsync = ON`: on Apple platforms, plain
-    ///   `fsync()` doesn't ask the drive to flush its write cache. These make SQLite use
-    ///   `F_FULLFSYNC`, which does. It costs latency on each commit, which is acceptable
-    ///   at autosave rates.
+    /// - `fullfsync = ON` / `checkpoint_fullfsync = ON`: requests `F_FULLFSYNC` (flush
+    ///   the drive's write cache) on Apple platforms. Measured on macOS 26.5 with the
+    ///   system SQLite 3.51.0, each WAL commit issues `F_BARRIERFSYNC` instead (ordered,
+    ///   but not a cache flush). ARCHITECTURE.md ("Durability") has the evidence and what
+    ///   it means for power loss.
     func configureForDurability() throws(StoreError) {
         try execute("""
             PRAGMA journal_mode = WAL;

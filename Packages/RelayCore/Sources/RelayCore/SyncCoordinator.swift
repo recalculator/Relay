@@ -43,9 +43,17 @@ public protocol SyncEngineControl: AnyObject, Sendable {
 /// ## Isolation
 ///
 /// An actor, because the engine calls its delegate from background tasks. Every
-/// `await` is a suspension point where another call can interleave (reentrancy).
-/// Account resolution guards against that with a resolution id: a resolution that was
-/// superseded while suspended abandons its result.
+/// `await` is a suspension point where another call can run on this actor
+/// (reentrancy), so a check made before an `await` may no longer hold after it.
+///
+/// * **Engine operations** take an `EngineLease` when they begin: the engine, the store
+///   instance it syncs, and a `SyncFence`. After every `await` the operation checks
+///   the lease is still current before touching shared state, and every write goes to
+///   `lease.store`, never to whatever `store` is by then. The store also checks the
+///   fence inside each write's transaction, so a write queued before the engine
+///   stopped, but run after, changes nothing.
+/// * **Account resolution** uses a resolution id: a resolution that was superseded
+///   while suspended abandons its result.
 public actor SyncCoordinator {
     public enum AccountState: Sendable, Equatable {
         /// Not yet established (startup, or just after an account change). No engine.
@@ -74,6 +82,16 @@ public actor SyncCoordinator {
     private var makeEngine: EngineFactory?
     /// Non-nil only while `accountState` is `.active` (invariant 1).
     private var engine: (any SyncEngineControl)?
+    /// Non-nil exactly when `engine` is.
+    private var lease: EngineLease?
+
+    /// One engine's tenure. Operations capture it when they begin and check it after
+    /// each suspension (see "Isolation").
+    struct EngineLease: Sendable {
+        let source: ObjectIdentifier
+        let store: NoteStore
+        let fence: SyncFence
+    }
     /// False once the current engine delivered a change that couldn't be applied
     /// (invariant 3). Reset when a new engine is created.
     private var canPersistEngineState = true
@@ -95,6 +113,21 @@ public actor SyncCoordinator {
     /// the snapshot stays pending, so an older upload finishing late can't hide a newer
     /// edit.
     private var inFlight: [UUID: Int64] = [:]
+
+    /// Places where a test can suspend the coordinator, to make another call interleave
+    /// there deterministically. Nil in the app.
+    enum Checkpoint: Sendable, Equatable {
+        case appliedFetchedChange
+        case appliedSendResult
+        case readSavedStateForSyncNow
+    }
+    private var checkpoint: (@Sendable (Checkpoint) async -> Void)?
+
+    func inFlightVersion(for id: UUID) -> Int64? { inFlight[id] }
+
+    func setCheckpointForTesting(_ hook: @escaping @Sendable (Checkpoint) async -> Void) {
+        checkpoint = hook
+    }
 
     /// - Parameter sleep: Waits between account-determination retries. Tests inject a
     ///   controllable version.
@@ -181,14 +214,15 @@ public actor SyncCoordinator {
 
     /// Upload data for one pending note, or nil to skip it.
     public func snapshotForUpload(_ id: UUID, from source: ObjectIdentifier) async -> UploadSnapshot? {
-        guard isCurrent(source), case .active = accountState else { return nil }
+        guard let lease = lease(for: source) else { return nil }
         do throws(StoreError) {
-            guard let snapshot = try await store.uploadSnapshot(id: id) else {
+            let snapshot = try await lease.store.uploadSnapshot(id: id)
+            guard isValid(lease) else { return nil }  // Stopped while reading.
+            guard let snapshot else {
                 // Nothing to upload (already synced or gone). Drop the stale entry.
                 engine?.removePendingSaves([id])
                 return nil
             }
-            guard isCurrent(source) else { return nil }  // Torn down while reading.
             inFlight[id] = snapshot.localVersion
             return snapshot
         } catch {
@@ -198,26 +232,31 @@ public actor SyncCoordinator {
     }
 
     public func canUpload(from source: ObjectIdentifier) -> Bool {
-        guard isCurrent(source), case .active = accountState else { return false }
-        return true
+        lease(for: source) != nil
     }
 
     /// Applies the per-record results of one sent batch.
     ///
-    /// Results from an engine that has since been torn down are ignored. The affected
-    /// rows stay pending, and the next upload reconciles them through change tags: if
-    /// the ignored save had succeeded, the retry fails with `serverRecordChanged`
-    /// carrying identical content, which resolves to "adopt metadata". No duplicate is
-    /// created and nothing is lost.
+    /// Results from an engine that has since been torn down are ignored, including the
+    /// rest of a batch when the engine stops part-way through it. The affected rows stay
+    /// pending, and the next upload reconciles them through change tags: if the ignored
+    /// save had succeeded, the retry fails with `serverRecordChanged` carrying identical
+    /// content, which resolves to "adopt metadata". No duplicate is created and nothing
+    /// is lost.
     public func handleSendResults(_ results: [SendResult], from source: ObjectIdentifier) async {
-        guard isCurrent(source) else {
+        guard let lease = lease(for: source) else {
             log("Ignored \(results.count) send results from a stopped engine; affected notes stay pending")
             return
         }
         var touched: Set<UUID> = []
         var anySaved = false
 
-        for result in results {
+        for (index, result) in results.enumerated() {
+            // `inFlight` now belongs to whichever engine replaced this one, if any.
+            guard isValid(lease) else {
+                log("Sync stopped while recording upload results; ignored the remaining \(results.count - index), which stay pending")
+                return
+            }
             switch result {
             case .saved(let remote):
                 let sentVersion = inFlight.removeValue(forKey: remote.id)
@@ -226,36 +265,40 @@ public actor SyncCoordinator {
                 }
                 // With an unknown sent version, use 0: the server metadata is stored, but
                 // the row stays pending and is re-sent on top of the new base.
-                await perform("record upload of \(remote.id)") { store throws(StoreError) in
-                    try await store.markUploaded(remote, sentVersion: sentVersion ?? 0)
+                await perform("record upload of \(remote.id)", in: lease) { store, fence throws(StoreError) in
+                    try await store.markUploaded(remote, sentVersion: sentVersion ?? 0, fence: fence)
                 }
                 touched.insert(remote.id)
                 anySaved = true
 
             case .failed(let id, let failure):
                 inFlight[id] = nil
-                touched.formUnion(await handleSendFailure(id: id, failure))
+                touched.formUnion(await handleSendFailure(id: id, failure, lease: lease))
             }
+            await checkpoint?(.appliedSendResult)
         }
 
+        guard isValid(lease) else { return }
         if anySaved { await status?.recordSendSuccess(at: now()) }
-        await reconcilePending(touched)
+        await reconcilePending(touched, lease: lease)
     }
 
-    private func handleSendFailure(id: UUID, _ failure: SendFailure) async -> Set<UUID> {
+    private func handleSendFailure(id: UUID, _ failure: SendFailure, lease: EngineLease) async -> Set<UUID> {
         switch failure {
         case .conflict(let server):
             log("Server had a newer version of a note; resolving")
-            return await applyRemote(.modified(server)) ?? []
+            return await applyRemote(.modified(server), lease: lease) ?? []
 
         case .recordMissing:
             log("Uploaded note referred to a missing record; recreating")
-            return await applyRemote(.recordGone(id)) ?? []
+            return await applyRemote(.recordGone(id), lease: lease) ?? []
 
         case .zoneMissing:
             log("Zone missing; recreating it")
-            engine?.addPendingZoneSave()
-            await perform("clear server metadata") { store throws(StoreError) in try await store.clearServerMetadata(id: id) }
+            engine?.addPendingZoneSave()  // No `await` since the caller checked the lease.
+            await perform("clear server metadata", in: lease) { store, fence throws(StoreError) in
+                try await store.clearServerMetadata(id: id, fence: fence)
+            }
             return [id]
 
         case .transient(let code):
@@ -281,21 +324,26 @@ public actor SyncCoordinator {
 
     /// Applies changes fetched by the current engine.
     ///
-    /// * From a stopped engine: ignored. Its state updates are ignored as well
-    ///   (invariant 2), so the persisted state still predates these changes and they are
-    ///   redelivered by the next engine.
+    /// * From a stopped engine: ignored, including the rest of a batch when the engine
+    ///   stops part-way through it. Its state updates are ignored as well (invariant 2),
+    ///   so the persisted state still predates these changes and they are redelivered
+    ///   by the next engine.
     /// * For a note with an upload in flight: skipped. That upload's result covers it,
     ///   either confirming our version (the change was our own echo) or failing with
     ///   `serverRecordChanged` and carrying the newest server version. If the app dies
     ///   first, the row is still pending, and the re-upload hits the same conflict path.
     /// * If applying fails: state persistence stops for this engine (invariant 3).
     public func handleFetchedChanges(_ changes: [RemoteChange], from source: ObjectIdentifier) async {
-        guard isCurrent(source), case .active = accountState else {
+        guard let lease = lease(for: source) else {
             log("Ignored \(changes.count) fetched changes from a stopped engine; they will be fetched again")
             return
         }
         var touched: Set<UUID> = []
-        for change in changes {
+        for (index, change) in changes.enumerated() {
+            guard isValid(lease) else {
+                log("Sync stopped while applying fetched changes; ignored the remaining \(changes.count - index), which will be fetched again")
+                return
+            }
             let id: UUID = switch change {
             case .modified(let note): note.id
             case .recordGone(let id): id
@@ -304,24 +352,27 @@ public actor SyncCoordinator {
                 Log.sync.debug("Deferring fetched change for in-flight note \(id, privacy: .public)")
                 continue
             }
-            guard let applied = await applyRemote(change) else {
-                stopPersistingEngineState(reason: "a fetched change couldn’t be saved")
+            guard let applied = await applyRemote(change, lease: lease) else {
+                if isValid(lease) { stopPersistingEngineState(reason: "a fetched change couldn’t be saved") }
                 continue
             }
             touched.formUnion(applied)
+            await checkpoint?(.appliedFetchedChange)
         }
-        await reconcilePending(touched)
+        await reconcilePending(touched, lease: lease)
     }
 
     public func handleZoneDeleted(_ reason: ZoneDeletionReason, from source: ObjectIdentifier) async {
-        guard isCurrent(source), case .active = accountState else { return }
+        guard let lease = lease(for: source) else { return }
         inFlight.removeAll()
         log("Server zone was removed (\(reason)); reconciling")
         do throws(StoreError) {
-            let pending = try await store.handleZoneDeleted(reason)
+            let pending = try await lease.store.handleZoneDeleted(reason, fence: lease.fence)
+            guard isValid(lease) else { return }
             engine?.addPendingZoneSave()
             engine?.addPendingSaves(pending)
         } catch {
+            guard isValid(lease) else { return }
             stopPersistingEngineState(reason: "a server reset couldn’t be applied")
             await reportProblem("Couldn’t apply a server reset: \(error.localizedDescription)")
         }
@@ -332,7 +383,7 @@ public actor SyncCoordinator {
 
     /// Persists the engine's state, subject to invariants 2 and 3.
     public func handleEngineStateUpdate(_ serialized: Data, from source: ObjectIdentifier) async {
-        guard isCurrent(source), case .active = accountState else {
+        guard let lease = lease(for: source) else {
             Log.sync.info("Not persisting state from a stopped engine")
             return
         }
@@ -340,7 +391,9 @@ public actor SyncCoordinator {
             Log.sync.info("Not persisting engine state: an earlier change from this engine wasn’t applied")
             return
         }
-        await perform("save engine state") { store throws(StoreError) in try await store.saveEngineState(serialized) }
+        await perform("save engine state", in: lease) { store, fence throws(StoreError) in
+            try await store.saveEngineState(serialized, fence: fence)
+        }
     }
 
     /// The engine reports an account transition. Per Apple's documentation, it has
@@ -377,14 +430,21 @@ public actor SyncCoordinator {
     /// Replaces the database during an account mismatch: the caller has archived the old
     /// account's database and opened `newStore` at the same path. The new store is bound
     /// to the current account, and a fresh engine fetches that account's data.
+    ///
+    /// The account is resolved again afterwards rather than assumed: it may have changed
+    /// while this was suspended. Any resolution already in flight is abandoned, since
+    /// it read the old database.
     public func startFresh(with newStore: NoteStore) async throws(StoreError) {
         guard case .mismatch(_, let current) = accountState else { return }
+        // Bind before swapping it in: until then nothing else can see the new store.
+        try await newStore.bindAccount(current)
         tearDownEngine()
         store = newStore
-        await observeLocalChanges()
-        try await newStore.bindAccount(current)
-        await activate(user: current, savedState: nil)
+        resolutionID += 1
+        accountState = .unknown
         log("Started a fresh database for the current account")
+        await observeLocalChanges()
+        await resolveAccount()
     }
 
     /// The account the device is signed in to, if it differs from the database's.
@@ -399,14 +459,20 @@ public actor SyncCoordinator {
     /// recreates the engine from the last persisted state, so that change is
     /// redelivered.
     public func syncNow() async {
-        guard case .active(let user) = accountState else {
+        guard case .active(let user) = accountState, let lease else {
             await revalidateAccount()
             return
         }
         if !canPersistEngineState {
+            let savedState = (try? await lease.store.engineState()) ?? nil
+            await checkpoint?(.readSavedStateForSyncNow)
+            // The account or engine may have changed while the state was read.
+            guard isValid(lease) else {
+                log("Sync changed while preparing Sync Now; not recreating the engine")
+                return
+            }
             log("Recreating the sync engine from the last saved state to re-fetch unapplied changes")
-            tearDownEngine()
-            await activate(user: user, savedState: (try? await store.engineState()) ?? nil)
+            await activate(user: user, savedState: savedState)
         }
         guard let engine else { return }
         do {
@@ -481,6 +547,7 @@ public actor SyncCoordinator {
         guard makeEngine != nil else { return }  // Not started yet; `start` resolves.
         resolutionID += 1
         let id = resolutionID
+        let store = self.store
         let account = await accounts.currentAccount()
         let bound: String?
         let savedState: Data?
@@ -491,7 +558,8 @@ public actor SyncCoordinator {
             await reportProblem("Couldn’t read sync state: \(error.localizedDescription)")
             return
         }
-        guard id == resolutionID else { return }  // Superseded while suspended.
+        // Superseded while suspended. (Replacing the store also supersedes it.)
+        guard id == resolutionID, store === self.store else { return }
 
         switch account {
         case .available(let user):
@@ -535,17 +603,23 @@ public actor SyncCoordinator {
         canPersistEngineState = true
         inFlight.removeAll()
         pendingAccountRetry?.cancel()
-        engine = makeEngine(self, savedState)
+        let fence = store.beginSyncSession(owner: user)
+        let engine = makeEngine(self, savedState)
+        self.engine = engine
+        lease = EngineLease(source: engine.eventSourceID, store: store, fence: fence)
         log("Sync engine started (\(savedState == nil ? "fresh state" : "restored state"))")
         await publishAvailability()
         await queueAllPendingWork()
     }
 
     /// Stops the current engine. Its later events are ignored because they no longer
-    /// match `engine`. The cancellation isn't awaited, because this may run inside one of
+    /// match `lease`, and its writes already queued on the store are rejected by the
+    /// store's fence. The cancellation isn't awaited, because this may run inside one of
     /// that engine's own callbacks, which it would wait for.
     private func tearDownEngine() {
         guard let old = engine else { return }
+        lease?.store.endSyncSession()
+        lease = nil
         engine = nil
         inFlight.removeAll()
         teardowns.append(Task { await old.cancelOperations() })
@@ -588,7 +662,20 @@ public actor SyncCoordinator {
     }
 
     private func isCurrent(_ source: ObjectIdentifier) -> Bool {
-        engine?.eventSourceID == source
+        lease?.source == source
+    }
+
+    /// The lease for an operation starting now, if `source` is the current engine.
+    private func lease(for source: ObjectIdentifier) -> EngineLease? {
+        guard let lease, lease.source == source, case .active = accountState else { return nil }
+        return lease
+    }
+
+    /// Whether `lease` is still the current one: same engine, same store, same session.
+    /// Checked after every suspension in an engine operation.
+    private func isValid(_ lease: EngineLease) -> Bool {
+        guard let current = self.lease else { return false }
+        return current.source == lease.source && current.store === lease.store && current.fence == lease.fence
     }
 
     // MARK: Private helpers
@@ -606,10 +693,10 @@ public actor SyncCoordinator {
         }
     }
 
-    /// Returns the affected ids, or nil if the store failed to apply the change.
-    private func applyRemote(_ change: RemoteChange) async -> Set<UUID>? {
+    /// Returns the affected ids, or nil if the store didn't apply the change.
+    private func applyRemote(_ change: RemoteChange, lease: EngineLease) async -> Set<UUID>? {
         do throws(StoreError) {
-            let result = try await store.applyRemote(change)
+            let result = try await lease.store.applyRemote(change, fence: lease.fence)
             if let copy = result.conflictCopyID {
                 log("Conflict: kept both versions (copy \(copy.uuidString.prefix(8)))")
             }
@@ -623,20 +710,25 @@ public actor SyncCoordinator {
                 return Set([id] + (result.conflictCopyID.map { [$0] } ?? []))
             }
         } catch {
-            await reportProblem("Couldn’t save a change from iCloud: \(error.localizedDescription)")
+            if isValid(lease) {
+                await reportProblem("Couldn’t save a change from iCloud: \(error.localizedDescription)")
+            } else {
+                Log.sync.info("Discarded a change from a stopped sync session: \(String(describing: error), privacy: .public)")
+            }
             return nil
         }
     }
 
     /// Makes the engine's pending list match the database for `ids`: unsynced rows are
     /// added, and rows with nothing left to upload are removed.
-    private func reconcilePending(_ ids: Set<UUID>) async {
-        guard !ids.isEmpty, let engine else {
+    private func reconcilePending(_ ids: Set<UUID>, lease: EngineLease) async {
+        guard !ids.isEmpty, isValid(lease) else {
             await publishPendingCount()
             return
         }
         do throws(StoreError) {
-            let pending = Set(try await store.pendingChanges().map(\.noteID))
+            let pending = Set(try await lease.store.pendingChanges().map(\.noteID))
+            guard isValid(lease), let engine else { return }
             engine.addPendingSaves(Array(ids.intersection(pending)))
             engine.removePendingSaves(Array(ids.subtracting(pending)))
         } catch {
@@ -648,12 +740,13 @@ public actor SyncCoordinator {
     /// Re-queues every unsynced row. The database, not the engine's state, is the record
     /// of pending work. The engine deduplicates, so repeating this is harmless.
     private func queueAllPendingWork() async {
-        guard case .active = accountState, let engine else {
+        guard case .active = accountState, let lease, let engine else {
             await publishPendingCount()
             return
         }
         do throws(StoreError) {
-            let ids = try await store.pendingChanges().map(\.noteID)
+            let ids = try await lease.store.pendingChanges().map(\.noteID)
+            guard isValid(lease) else { return }
             engine.addPendingZoneSave()
             engine.addPendingSaves(ids)
             if !ids.isEmpty { log("Queued \(ids.count) pending changes from the database") }
@@ -679,6 +772,24 @@ public actor SyncCoordinator {
         case .mismatch: .accountMismatch
         }
         await status?.setAvailability(availability)
+    }
+
+    /// Runs a fenced store write for an engine operation. A write rejected because the
+    /// session ended is expected (the engine stopped meanwhile) and isn't a problem.
+    private func perform(
+        _ what: String,
+        in lease: EngineLease,
+        _ body: (NoteStore, SyncFence) async throws(StoreError) -> Void
+    ) async {
+        do throws(StoreError) {
+            try await body(lease.store, lease.fence)
+        } catch {
+            if isValid(lease) {
+                await reportProblem("Couldn’t \(what): \(error.localizedDescription)")
+            } else {
+                Log.sync.info("Skipped “\(what, privacy: .public)” from a stopped sync session: \(String(describing: error), privacy: .public)")
+            }
+        }
     }
 
     /// Runs a store operation, reporting rather than swallowing a failure.

@@ -111,3 +111,12 @@ public enum ZoneDeletionReason: Sendable, Equatable {
     /// The user reset their end-to-end encrypted data. Apple's guidance is to re-upload.
     case encryptedDataReset
 }
+
+/// Identifies one sync session: the account that owns the database, and the session
+/// number the store assigned when the engine was created. Every write the sync layer
+/// makes carries one, and the store rejects it inside the write's transaction if the
+/// session has ended or the owner changed. See `NoteStore.beginSyncSession(owner:)`.
+public struct SyncFence: Sendable, Equatable {
+    public let owner: String
+    public let epoch: UInt64
+}

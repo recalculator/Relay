@@ -222,3 +222,53 @@ right tool here.
 causing data races", because `SimulatedDevice` is a non-`Sendable` class. Capturing the
 coordinator (an actor, so `Sendable`) into a local first fixed it. Swift 6 refused to
 let two child tasks share a mutable class.
+
+# Added in the reentrancy and benchmarking revision
+
+## Capture what you operate on; don't re-read it after an `await`
+
+The bug: `handleFetchedChanges` checked "is this still the current engine?" once, then
+looped over changes with `await store.applyRemote(…)` inside. Each `await` lets other
+calls run on the actor. "Use This Account's Notes" could swap `self.store` mid-loop,
+and the next iteration read the *new* `store` and wrote the old account's data into the
+new account's database. The fix (`SyncCoordinator.swift`) is an `EngineLease` captured
+when the operation starts. Writes go to `lease.store`, and `isValid(lease)` is checked
+again after every suspension. The rule is the same one behind `resolutionID`: anything
+read before an `await` is a snapshot, not a fact.
+
+## Enforcing an invariant where the write happens
+
+A coordinator check right before `await store.write(…)` still leaves a gap. The call is
+queued on the store actor and may run after the coordinator has moved on. So every
+sync write carries a `SyncFence` (`NoteStore+Sync.swift`), and the store re-checks it as
+the first statement *inside* the write's SQL transaction. The session counter is an
+`OSAllocatedUnfairLock` rather than actor state, so `endSyncSession()` is `nonisolated`
+and synchronous. `tearDownEngine()` can call it without an `await`, including from
+inside the engine's own callback.
+
+## Test checkpoints for exact interleavings
+
+`SyncCoordinator.Checkpoint` is a test-only hook (`nil` in the app) awaited at chosen
+points. `CheckpointPause` (`ReentrancyTests.swift`) parks the coordinator there, the
+test switches accounts or replaces the database, then releases it. Each new test was
+run against the old code first and failed. Each safeguard was then removed one at a
+time to check that some test notices (TESTING.md → Mutation checks).
+
+## Measuring what the OS actually does
+
+`PRAGMA fullfsync = ON` reads back as 1, which proves the setting, not the system
+call. `Scripts/fsync-probe.sh` loads a small C library with `DYLD_INSERT_LIBRARIES`.
+Through the `__DATA,__interpose` section, it wraps `fcntl` and `fsync` to count
+`F_FULLFSYNC` and `F_BARRIERFSYNC`. It showed the system SQLite issuing barrier syncs,
+not full syncs, so the durability docs were corrected. An earlier attempt used
+SQLite's own `xSetSystemCall("fcntl")` hook and counted zero calls even where a sync
+had to happen. A probe that can't detect a known-positive case isn't evidence.
+
+## Reading a query plan
+
+`EXPLAIN QUERY PLAN` for the notes-list query printed `USE TEMP B-TREE FOR ORDER BY`:
+SQLite was sorting all rows, bodies included, on every load. An index whose column
+order matches `WHERE is_deleted = 0 ORDER BY modified_at DESC, id` lets SQLite walk the
+index in order instead. A test checks the plan of the exact SQL `allNotes()` runs
+(`NoteStore.allNotesQuery`), so a future edit to the query or the index can't silently
+bring the sort back.

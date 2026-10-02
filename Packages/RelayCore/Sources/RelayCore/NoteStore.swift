@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// The durable local store, and the source of truth the UI reads and edits.
 ///
@@ -16,6 +17,9 @@ public actor NoteStore {
     let db: SQLiteConnection
     let now: @Sendable () -> Date
     private var observers: [UUID: AsyncStream<StoreChange>.Continuation] = [:]
+    /// The current sync session's number. See `beginSyncSession(owner:)`. A lock rather
+    /// than actor state, so the coordinator can end a session without an `await`.
+    let syncEpoch = OSAllocatedUnfairLock<UInt64>(initialState: 0)
 
     /// Opens, or creates, the database at `url` and migrates it to the current schema.
     ///
@@ -99,12 +103,12 @@ public actor NoteStore {
 
     /// All live (non-deleted) notes, most recently modified first.
     public func allNotes() throws(StoreError) -> [Note] {
-        try db.query(
-            "SELECT \(Self.noteColumns) FROM notes WHERE is_deleted = 0 ORDER BY modified_at DESC, id",
-            [],
-            Self.decodeNote
-        )
+        try db.query(Self.allNotesQuery, [], Self.decodeNote)
     }
+
+    /// Served in order by the `notes_live_by_modified` index (schema v3), with no sort.
+    static let allNotesQuery =
+        "SELECT \(noteColumns) FROM notes WHERE is_deleted = 0 ORDER BY modified_at DESC, id"
 
     /// The live note with this id, or nil if it doesn't exist or has been deleted.
     public func note(id: UUID) throws(StoreError) -> Note? {
@@ -222,6 +226,11 @@ public actor NoteStore {
 
     func queryTextForTesting(_ sql: String) throws(StoreError) -> String? {
         try db.query(sql) { $0.string(0) }.first ?? nil
+    }
+
+    /// SQLite's plan for `sql`: one "detail" string per step.
+    func queryPlanForTesting(_ sql: String) throws(StoreError) -> [String] {
+        try db.query("EXPLAIN QUERY PLAN " + sql) { $0.string(3) ?? "" }
     }
 
     // MARK: Shared helpers

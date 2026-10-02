@@ -18,10 +18,18 @@ swift test --package-path Packages/RelayCore
 xcodebuild test -project Relay.xcodeproj -scheme Relay -destination 'platform=macOS'
 ```
 
-Last recorded results (2026-10-01, macOS 26.5, Xcode 26.6, Swift 6.3.3):
-- `swift test`: **87 tests in 14 suites passed**. Repeated 25 consecutive times with no
-  failures (flakiness check).
-- `xcodebuild test`: 87 tests passed.
+Last recorded results (2026-10-02, macOS 26.5, Xcode 26.6, Swift 6.3.3, working tree on
+top of `023c369`):
+- `swift test`: **94 tests in 16 suites passed**.
+- `xcodebuild test` (macOS): 94 tests passed.
+- Flakiness check: the 29 account-lifecycle and reentrancy tests (7 suites), which
+  interleave tasks, passed **25 of 25** consecutive runs.
+- The macOS app builds with and without `RELAY_CLOUDKIT`. Not signed, not run with
+  CloudKit.
+
+Earlier (2026-10-01): 87 tests in 14 suites, repeated 25 times.
+
+Benchmarks are separate from these tests: see BENCHMARKS.md.
 
 ## How the simulation works
 
@@ -39,6 +47,10 @@ Last recorded results (2026-10-01, macOS 26.5, Xcode 26.6, Swift 6.3.3):
 - `FakeAccountProvider` controls what iCloud reports (available user, no account,
   temporarily unavailable, couldn't determine). It can also hold queries so overlapping
   resolutions happen deterministically.
+- `SyncCoordinator.Checkpoint` (a test-only hook, `nil` in the app) lets
+  `CheckpointPause` suspend the coordinator at a chosen `await`. The test changes
+  accounts or replaces the database there, then resumes it. This is how reentrancy is
+  tested without timing.
 - `ManualSleeper` replaces the account-retry delay. A retry happens only when the test
   releases it.
 - `SimulatedDevice` = a real `NoteStore` file + a real `SyncCoordinator` + the fakes.
@@ -88,6 +100,13 @@ Last recorded results (2026-10-01, macOS 26.5, Xcode 26.6, Swift 6.3.3):
 | **Restart after a rejected event** (apply failed) redelivers it; Sync Now recovers in-session | `changeThatFailedToApply…`, `syncNowRecreatesTheEngine…` | simulated |
 | **Restart after a deferred/ignored event** redelivers or recovers it | `changesIgnoredFromAStoppedEngine…`, `deferredInFlightChange…` | simulated |
 | Account switch archives old database intact | `startingFreshArchives…` | simulated |
+| **Fetched batch stops when the database is replaced part-way**; nothing reaches the new account's database | `fetchedBatchStopsWhenTheDatabaseIsReplacedPartWay` | simulated |
+| **Upload results stop when the account changes part-way**; recovers without duplicates | `sendResultsStopApplyingWhenTheAccountChangesPartWay` | simulated |
+| A stopped engine's late results don't consume a newer engine's in-flight entry | `lateResultsFromAStoppedEngine…` | simulated |
+| **Sync Now doesn't restart sync after the account changed while it waited** | `syncNowDoesNotRestart…` | simulated |
+| A stale account check doesn't replace the fresh database's engine | `accountResolutionInFlightIsAbandoned…` | simulated |
+| Store rejects sync writes from an ended session or another owner, inside the transaction | `writesFromAnEndedSessionOrAnotherOwnerChangeNothing` | local |
+| Notes-list query uses the v3 index (no temp B-tree sort) | `loadingTheNotesListUsesTheIndexInsteadOfSorting` | local |
 | Conflict copies of identical content in unrelated notes stay distinct | `identicalContentConflictingInUnrelatedNotes…`, `conflictCopyIdentity…` | simulated / pure |
 | Remote deletion with unsaved draft → Keep as New Note | `draftOfNoteDeletedElsewhere…`, `cleanEditorCloses…` | local |
 | Conflict decision table; deterministic copy ids | `ConflictResolver (pure)` | pure |
@@ -122,6 +141,25 @@ suite was run, and the code was restored. All of the following were caught:
 | Resolve before `start` | `accountChecksBeforeStartAreIgnored` |
 | Drop the superseded-resolution check | `overlappingResolutions…`. Initially **missed** because the test didn't really overlap; the test was fixed. |
 
+### Mutation checks (2026-10-02): reentrancy and index
+
+All five reentrancy tests **failed against the code before the fix** (the
+send-results test only after it was strengthened to check server metadata). Then each
+new safeguard was removed:
+
+| Mutation | Result |
+|---|---|
+| Drop the per-iteration lease check in the upload-results loop | Caught: `lateResultsFromAStoppedEngine…` |
+| Drop the lease re-check in Sync Now | Caught: `syncNowDoesNotRestart…` |
+| Disable the store's fence check | Caught: `writesFromAnEndedSession…` |
+| Drop the fence check **and** the fetch-loop lease check | Caught: `fetchedBatchStops…` |
+| Drop only the fetch-loop lease check | **Not caught.** The store fence still rejects the stale writes. |
+| Drop the fetch-loop lease check and write to `self.store` instead of `lease.store` | **Not caught.** The fence's owner check rejects the write into the other account's database. |
+| Remove the v3 index | Caught: `loadingTheNotesList…`, `v1DatabaseMigrates…` |
+
+The two "not caught" rows are expected: each layer alone prevents that bug, so
+removing one of them is masked by the other.
+
 Not covered by a failing test: the `tearDownEngine()` at the start of `activate`. With
 the superseded-resolution check in place, no second activation can happen, so removing
 it changes no observable behavior. It's kept as a one-line local guarantee.
@@ -142,7 +180,7 @@ it changes no observable behavior. It's kept as a one-line local guarantee.
      "PRAGMA user_version; SELECT id, is_deleted, local_version, synced_version FROM notes;"
    ```
 
-Recorded so far: automated launches confirmed the sandboxed app starts, creates the
+Recorded so far (manual steps 2–3 still **not performed** as of 2026-10-02): automated launches confirmed the sandboxed app starts, creates the
 database, and migrated it from v1 to v2 on 2026-10-01. Interactive steps 2–3 had **not**
 been performed by the time of writing (the database contained 0 notes).
 

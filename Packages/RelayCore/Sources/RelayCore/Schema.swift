@@ -8,11 +8,12 @@
 /// that has run on real data. A file whose version is newer than `currentVersion` is
 /// refused rather than opened.
 enum Schema {
-    static let currentVersion = 2
+    static let currentVersion = 3
 
     private static let migrations: [(version: Int, sql: String)] = [
         (1, v1),
         (2, v2),
+        (3, v3),
     ]
 
     static func migrate(_ db: SQLiteConnection) throws(StoreError) {
@@ -71,5 +72,13 @@ enum Schema {
             key   TEXT PRIMARY KEY NOT NULL,
             value BLOB NOT NULL
         ) STRICT;
+        """
+
+    /// v3: an index matching `NoteStore.allNotes()`'s `WHERE is_deleted = 0 ORDER BY
+    /// modified_at DESC, id`, so SQLite reads live notes in order instead of copying
+    /// every row (bodies included) into a temporary B-tree to sort it. Measured in
+    /// BENCHMARKS.md. The query and its results are unchanged.
+    private static let v3 = """
+        CREATE INDEX notes_live_by_modified ON notes (is_deleted, modified_at DESC, id);
         """
 }

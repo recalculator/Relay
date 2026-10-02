@@ -16,3 +16,6 @@ DerivedData/
 xcuserdata/
 *.xcuserstate
 .DS_Store
+
+# RelayBench smoke runs (--quick) aren't results
+benchmark-results/*-quick.json
