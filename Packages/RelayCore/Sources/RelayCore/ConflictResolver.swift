@@ -24,13 +24,18 @@ public enum ConflictResolver {
     public struct LocalState: Sendable, Equatable {
         public var title: String
         public var body: String
+        public var kind: EntryKind
         public var isDeleted: Bool
         public var hasUnsyncedChanges: Bool
         public var baseChangeTag: String?
 
-        public init(title: String, body: String, isDeleted: Bool, hasUnsyncedChanges: Bool, baseChangeTag: String?) {
+        public init(
+            title: String, body: String, kind: EntryKind = .snippet,
+            isDeleted: Bool, hasUnsyncedChanges: Bool, baseChangeTag: String?
+        ) {
             self.title = title
             self.body = body
+            self.kind = kind
             self.isDeleted = isDeleted
             self.hasUnsyncedChanges = hasUnsyncedChanges
             self.baseChangeTag = baseChangeTag
@@ -80,7 +85,8 @@ public enum ConflictResolver {
             case (false, true):
                 return .keepLocal  // Our edit vs. their delete: the edit wins.
             case (false, false):
-                let sameContent = local.title == server.title && local.body == server.body
+                // The kind is content too: snippet vs. template is a user edit.
+                let sameContent = local.title == server.title && local.body == server.body && local.kind == server.kind
                 return sameContent ? .adoptRemoteMetadata : .applyRemoteAndCopyLocal
             }
         }
@@ -96,12 +102,15 @@ public enum ConflictCopy {
     /// Handling the same conflict twice (for example after a crash and retry, or a
     /// repeated fetch) produces the same id, so the copy is upserted rather than
     /// duplicated.
-    public static func id(original: UUID, title: String, body: String) -> UUID {
+    ///
+    /// The kind is hashed only for templates, so the ids of snippet copies are the same
+    /// as before entry kinds existed.
+    public static func id(original: UUID, title: String, body: String, kind: EntryKind = .snippet) -> UUID {
         var hasher = SHA256()
         hasher.update(data: Data("relay.conflict-copy.v1".utf8))
         hasher.update(data: Data(original.uuidString.utf8))
         // Length-prefix each field so ("ab","c") and ("a","bc") hash differently.
-        for field in [title, body] {
+        for field in [title, body] + (kind == .snippet ? [] : [kind.rawValue]) {
             let bytes = Data(field.utf8)
             hasher.update(data: withUnsafeBytes(of: UInt64(bytes.count).bigEndian) { Data($0) })
             hasher.update(data: bytes)

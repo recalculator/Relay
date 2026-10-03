@@ -256,8 +256,8 @@ struct SyncTests {
         // A sync replaces the content while an editor still holds "old" as its base.
         try await store.executeForTesting("UPDATE notes SET body = 'synced from elsewhere' WHERE id = '\(note.id.uuidString)'")
 
-        try await store.updateNote(id: note.id, title: "t", body: "my draft", base: ("t", "old"))
-        try await store.updateNote(id: note.id, title: "t", body: "my draft 2", base: ("t", "my draft"))
+        try await store.updateNote(id: note.id, title: "t", body: "my draft", base: NoteContent(title: "t", body: "old"))
+        try await store.updateNote(id: note.id, title: "t", body: "my draft 2", base: NoteContent(title: "t", body: "my draft"))
 
         #expect(contents(try await store.allNotes()) == ["t (Conflict copy)|synced from elsewhere", "t|my draft 2"])
     }
@@ -409,5 +409,48 @@ struct SyncTests {
             if ids.contains(note.id) { break }
         }
         #expect(engine.pending.contains(note.id))
+    }
+}
+
+
+@Suite("Entry kinds through storage and simulated sync")
+struct EntryKindSyncTests {
+    let cloud = FakeCloud()
+
+    @Test func templateKindAndMultilineBodySyncToAnotherDevice() async throws {
+        let a = try await SimulatedDevice("A", cloud: cloud)
+        let b = try await SimulatedDevice("B", cloud: cloud)
+        await a.start()
+        await b.start()
+        let body = "kubectl -n {{namespace}} \\\n  logs deploy/{{app}} --since=1h"
+        try await a.store.createNote(title: "Tail logs", body: body, kind: .template)
+        try await a.sync()
+        try await b.sync()
+        let received = try #require(try await b.liveNotes.first)
+        #expect(received.kind == .template)
+        #expect(received.body == body)
+    }
+
+    @Test func concurrentKindChangeKeepsBothVersions() async throws {
+        let a = try await SimulatedDevice("A", cloud: cloud)
+        let b = try await SimulatedDevice("B", cloud: cloud)
+        await a.start()
+        await b.start()
+        let note = try await a.store.createNote(title: "ssh", body: "ssh {{host}}")
+        try await a.sync()
+        try await b.sync()
+
+        try await a.store.updateNote(id: note.id, title: "ssh", body: "ssh {{host}}", kind: .template)
+        try await b.store.updateNote(id: note.id, title: "ssh", body: "ssh prod.example.com")
+        try await a.sync()
+        try await b.sync()  // B's upload conflicts with A's; B keeps its version as a copy.
+        try await a.sync()
+
+        for device in [a, b] {
+            let notes = try await device.liveNotes
+            #expect(notes.count == 2)
+            #expect(notes.first { $0.id == note.id }?.kind == .template)
+            #expect(notes.first { $0.conflictOf == note.id }?.body == "ssh prod.example.com")
+        }
     }
 }

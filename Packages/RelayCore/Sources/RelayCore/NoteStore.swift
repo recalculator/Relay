@@ -137,9 +137,9 @@ public actor NoteStore {
     /// Creates and persists a new note. When this returns, the note and its pending
     /// upload are committed together.
     @discardableResult
-    public func createNote(title: String = "", body: String = "") throws(StoreError) -> Note {
+    public func createNote(title: String = "", body: String = "", kind: EntryKind = .snippet) throws(StoreError) -> Note {
         let timestamp = now()
-        let note = Note(id: UUID(), title: title, body: body, createdAt: timestamp, modifiedAt: timestamp)
+        let note = Note(id: UUID(), title: title, body: body, createdAt: timestamp, modifiedAt: timestamp, kind: kind)
         // One INSERT writes both the content and local_version = 1 > synced_version = 0.
         // The "needs upload" marker is part of the same row, so it can't be lost separately.
         try insert(note, localVersion: 1)
@@ -147,11 +147,12 @@ public actor NoteStore {
         return note
     }
 
-    /// Replaces a note's title and body.
+    /// Replaces a note's title, body, and (if given) kind.
     ///
     /// If nothing actually changed, the call is a no-op that does not bump the version.
     /// Repeated identical saves therefore produce no new sync work.
     ///
+    /// - Parameter kind: The new kind, or nil to keep the stored one.
     /// - Parameter base: The content the caller's draft was based on. If the stored
     ///   content no longer matches it, someone else changed the note (normally a sync
     ///   from another device) after the draft was loaded. Rather than silently
@@ -163,15 +164,17 @@ public actor NoteStore {
         id: UUID,
         title: String,
         body: String,
-        base: (title: String, body: String)? = nil
+        kind: EntryKind? = nil,
+        base: NoteContent? = nil
     ) throws(StoreError) -> Note {
         var changedIDs: [UUID] = []
         let note = try db.transaction { () throws(StoreError) -> Note in
             guard var note = try fetchLiveNote(id) else { throw .noteNotFound(id) }
-            guard note.title != title || note.body != body else { return note }
+            let kind = kind ?? note.kind
+            guard note.content != NoteContent(title: title, body: body, kind: kind) else { return note }
 
-            if let base, (note.title, note.body) != base {
-                if let copyID = try insertConflictCopy(of: id, title: note.title, body: note.body) {
+            if let base, note.content != base {
+                if let copyID = try insertConflictCopy(of: id, content: note.content) {
                     changedIDs.append(copyID)
                     Log.storage.notice("Draft was based on stale content; kept newer stored version as conflict copy for note \(id, privacy: .public)")
                 }
@@ -179,14 +182,16 @@ public actor NoteStore {
 
             note.title = title
             note.body = body
+            note.kind = kind
             note.modifiedAt = now()
             try db.run(
                 """
                 UPDATE notes
-                SET title = ?, body = ?, modified_at = ?, local_version = local_version + 1
+                SET title = ?, body = ?, kind = ?, modified_at = ?, local_version = local_version + 1
                 WHERE id = ?
                 """,
-                [.text(title), .text(body), .real(note.modifiedAt.timeIntervalSinceReferenceDate), .text(id.uuidString)]
+                [.text(title), .text(body), .text(kind.rawValue),
+                 .real(note.modifiedAt.timeIntervalSinceReferenceDate), .text(id.uuidString)]
             )
             changedIDs.append(id)
             return note
@@ -235,7 +240,7 @@ public actor NoteStore {
 
     // MARK: Shared helpers
 
-    static let noteColumns = "id, title, body, created_at, modified_at, conflict_of"
+    static let noteColumns = "id, title, body, created_at, modified_at, conflict_of, kind"
 
     func fetchLiveNote(_ id: UUID) throws(StoreError) -> Note? {
         try db.query(
@@ -248,8 +253,8 @@ public actor NoteStore {
     func insert(_ note: Note, localVersion: Int64) throws(StoreError) {
         try db.run(
             """
-            INSERT INTO notes (id, title, body, created_at, modified_at, conflict_of, local_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO notes (id, title, body, created_at, modified_at, conflict_of, kind, local_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(note.id.uuidString),
@@ -258,33 +263,35 @@ public actor NoteStore {
                 .real(note.createdAt.timeIntervalSinceReferenceDate),
                 .real(note.modifiedAt.timeIntervalSinceReferenceDate),
                 note.conflictOf.map { .text($0.uuidString) } ?? .null,
+                .text(note.kind.rawValue),
                 .integer(localVersion),
             ]
         )
     }
 
-    /// Saves `title`/`body` as a pending conflict copy of note `original`. The copy's id is
+    /// Saves `content` as a pending conflict copy of note `original`. The copy's id is
     /// derived from the content, so repeating this for the same content is a no-op.
     ///
     /// - Returns: The copy's id if a row was inserted, or nil if it already existed. An
     ///   existing row could also be a tombstone for a copy the user already deleted;
     ///   that stays deleted.
-    func insertConflictCopy(of original: UUID, title: String, body: String) throws(StoreError) -> UUID? {
-        let copyID = ConflictCopy.id(original: original, title: title, body: body)
+    func insertConflictCopy(of original: UUID, content: NoteContent) throws(StoreError) -> UUID? {
+        let copyID = ConflictCopy.id(original: original, title: content.title, body: content.body, kind: content.kind)
         let timestamp = now()
         try db.run(
             """
-            INSERT INTO notes (id, title, body, created_at, modified_at, conflict_of, local_version)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO notes (id, title, body, created_at, modified_at, conflict_of, kind, local_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
             ON CONFLICT(id) DO NOTHING
             """,
             [
                 .text(copyID.uuidString),
-                .text(ConflictCopy.title(forCopyOf: title)),
-                .text(body),
+                .text(ConflictCopy.title(forCopyOf: content.title)),
+                .text(content.body),
                 .real(timestamp.timeIntervalSinceReferenceDate),
                 .real(timestamp.timeIntervalSinceReferenceDate),
                 .text(original.uuidString),
+                .text(content.kind.rawValue),
             ]
         )
         return db.changes > 0 ? copyID : nil
@@ -314,7 +321,8 @@ public actor NoteStore {
             body: body,
             createdAt: Date(timeIntervalSinceReferenceDate: row.double(3)),
             modifiedAt: Date(timeIntervalSinceReferenceDate: row.double(4)),
-            conflictOf: try decodeOptionalID(row, column: 5)
+            conflictOf: try decodeOptionalID(row, column: 5),
+            kind: EntryKind(storedValue: row.string(6))
         )
     }
 }

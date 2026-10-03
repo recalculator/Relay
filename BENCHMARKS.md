@@ -30,7 +30,7 @@ summaries, and every raw sample, and prints a summary table.
 app's own `Application Support/Relay` directory), deletes only that directory, and
 never creates a CloudKit object. The notes are synthetic.
 
-## Environment of the recorded runs
+## Environment of the 2026-10-02 runs
 
 | | |
 |---|---|
@@ -43,10 +43,9 @@ never creates a CloudKit object. The notes are synthetic.
 | Power | AC power, **Low Power Mode ON** (`pmset lowpowermode 1`), thermal state nominal throughout |
 | Durability | Relay's own settings, applied by `NoteStore` itself: `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=ON`, `checkpoint_fullfsync=ON` |
 
-**Low Power Mode was on for every recorded run.** Before/after comparisons are valid,
-since all runs used the same conditions. But the absolute numbers are likely slower
-than with Low Power Mode off. Re-run `Scripts/benchmark.sh` with it off before quoting
-absolute figures.
+**Low Power Mode was on for all four 2026-10-02 runs.** Their before/after comparison
+(the v3 index) is valid, since they share conditions. Their absolute numbers are slower
+than with Low Power Mode off; see the 2026-10-03 run for numbers with it off.
 
 ## Methodology
 
@@ -101,7 +100,55 @@ Actual generated datasets:
 | 1,000 | 1.9 MB | 301 / 1,833 / 8,170 / 47,767 chars | 23 chars |
 | 10,000 | 19.1 MB | 339 / 1,889 / 8,215 / 49,648 chars | 23 chars |
 
-## Results (current code, with the v3 index)
+## Latest run: 2026-10-03, schema v4, Low Power Mode off, battery power
+
+`relaybench-2026-10-03T055853Z-e79d7c1.json`. One full run, made after entry kinds and
+revision history were added.
+
+| | |
+|---|---|
+| Code | `e79d7c1` plus uncommitted v4 changes: the `kind` column, the `note_revisions` table and triggers, and `updateNote(…, kind:, base: NoteContent)` |
+| Power | **Battery power, Low Power Mode off**, thermal state nominal throughout |
+| Machine, OS, toolchain, SQLite, durability | Same as the 2026-10-02 runs below |
+
+Same harness, seed, dataset (synthetic prose notes, all snippets), and workloads as
+before. The template and history features add no workload: neither is on the save,
+load, search, sync, or recovery paths measured here, apart from the `kind` column.
+
+| Workload | Variant | Notes | Samples | Median | p95 | p99 | Max | Per-rep medians |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| save-latency | updateNote (one transaction per edit) | 1,000 | 2,000 × 3 | 0.166 | 0.992 | 2.68 | 7.19 | 0.155, 0.152, 0.189 |
+| reopened-store | NoteStore.open | 1,000 | 10 × 3 | 0.196 | 0.271 | 0.319 | 0.319 | 0.205, 0.179, 0.204 |
+| reopened-store | NoteStore.open + allNotes() | 1,000 | 10 × 3 | 1.14 | 1.38 | 1.39 | 1.39 | 1.17, 1.09, 1.15 |
+| search | many matches “meeting” | 1,000 | 30 × 3 | 3.77 | 3.89 | 3.99 | 3.99 | 3.80, 3.77, 3.72 |
+| search | few matches “zephyrquill” | 1,000 | 30 × 3 | 5.52 | 5.68 | 5.71 | 5.71 | 5.52, 5.51, 5.53 |
+| search | no matches | 1,000 | 30 × 3 | 5.51 | 5.65 | 5.69 | 5.69 | 5.49, 5.51, 5.51 |
+| incoming-changes | SyncCoordinator.handleFetchedChanges, simulated transport | 1,000 | 1,000 × 3 | 168 | 393 | 393 | 393 | 393, 168, 167 |
+| pending-recovery | NoteStore.open + pendingChanges() after close | 1,000 | 10 × 3 | 0.696 | 0.894 | 0.904 | 0.904 | 0.788, 0.672, 0.669 |
+| save-latency | updateNote (one transaction per edit) | 10,000 | 2,000 × 3 | 0.406 | 2.65 | 4.22 | 23.21 | 0.490, 0.365, 0.342 |
+| reopened-store | NoteStore.open | 10,000 | 10 × 3 | 0.281 | 0.523 | 0.550 | 0.550 | 0.297, 0.278, 0.279 |
+| reopened-store | NoteStore.open + allNotes() | 10,000 | 10 × 3 | 9.93 | 10.34 | 10.44 | 10.44 | 9.93, 9.77, 9.99 |
+| search | many matches “meeting” | 10,000 | 30 × 3 | 37.54 | 38.56 | 40.88 | 40.88 | 37.31, 37.48, 37.57 |
+| search | few matches “zephyrquill” | 10,000 | 30 × 3 | 57.11 | 57.57 | 58.24 | 58.24 | 57.03, 57.05, 57.17 |
+| search | no matches | 10,000 | 30 × 3 | 56.89 | 57.46 | 59.81 | 59.81 | 56.99, 56.88, 56.81 |
+| incoming-changes | SyncCoordinator.handleFetchedChanges, simulated transport | 10,000 | 1,000 × 3 | 407 | 533 | 533 | 533 | 533, 407, 387 |
+| pending-recovery | NoteStore.open + pendingChanges() after close | 10,000 | 10 × 3 | 2.47 | 2.72 | 2.81 | 2.81 | 2.39, 2.51, 2.46 |
+
+Incoming-change throughput: 1,000-entry database, about 6,000 changes/s in two
+repetitions and about 2,500 in the first (393 ms). 10,000-entry database, about
+1,900–2,600 changes/s.
+
+**This is not a before/after comparison.** Three things changed at once since the
+2026-10-02 runs: Low Power Mode (on → off), the power source (AC → battery), and the
+code (schema v3 → v4). Medians are roughly half the earlier ones for CPU-bound work
+(search at 10,000 entries: 113 → 57 ms; list load: 21.5 → 9.9 ms), which is consistent
+with Low Power Mode being off, but this run can't separate the three causes. Save
+latency **tails** were worse than in the earlier runs (p95 0.99 ms at 1,000 entries,
+against about 0.45 ms). The first incoming-changes repetition at 1,000 entries took
+2.3× the other two. Neither was investigated. Treat them as run-to-run variation on
+battery power.
+
+## Earlier results: 2026-10-02, schema v3, Low Power Mode ON, AC power
 
 Times in milliseconds. These come from `relaybench-2026-10-02T042039Z` (run 1), with
 `…042134Z` (run 2) in the last column.
@@ -254,8 +301,9 @@ flush**. ARCHITECTURE.md → Durability has what that means for power loss.
 
 ## Limitations
 
-- One machine, one OS version, **Low Power Mode on**, warm OS file cache. iOS not
-  measured.
+- One machine, one OS version, warm OS file cache. The 2026-10-02 runs had Low Power
+  Mode on; the 2026-10-03 run was on battery power. No run so far has had both AC power
+  and Low Power Mode off. iOS not measured.
 - Synthetic, ASCII, English-word notes. Real notes (non-ASCII text, other scripts) may
   search at a different speed. The size distribution is an assumption.
 - Reopen numbers are warm-cache. True cold-disk launch time wasn't measured, because
@@ -304,5 +352,9 @@ describes this setup on that day, **not a latency guarantee**.
 - `Packages/RelayCore/Benchmarks/RelayBench/`: the harness (`Dataset.swift`,
   `Workloads.swift`, `Measure.swift`, `Workspace.swift`, `main.swift`).
 - `Scripts/benchmark.sh`, `Scripts/fsync-probe.sh`, `Scripts/fsync-probe/interpose.c`
-- `benchmark-results/*.json`: raw results. The four recorded runs: `…041650Z` and
-  `…041839Z` (before the v3 index), and `…042039Z` and `…042134Z` (after).
+- `benchmark-results/*.json`: raw results, never overwritten (one timestamped file per
+  run):
+  - `…2026-10-02T041650Z`, `…041839Z`: schema v2, Low Power Mode **on**, AC power
+    (before the v3 index)
+  - `…2026-10-02T042039Z`, `…042134Z`: schema v3, Low Power Mode **on**, AC power
+  - `…2026-10-03T055853Z`: schema v4, Low Power Mode **off**, **battery** power

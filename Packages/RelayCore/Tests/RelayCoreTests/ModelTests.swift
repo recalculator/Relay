@@ -38,6 +38,24 @@ struct NoteEditorModelTests {
         #expect(savedNotes.map(\.body) == ["b2"])
     }
 
+    /// Turning a snippet into a template is an ordinary edit: it's saved through
+    /// `updateNote` and becomes pending sync work carrying the new kind.
+    @Test func changingTheKindIsSavedAndQueuedForUpload() async throws {
+        let note = try await store.createNote(title: "deploy", body: "make deploy ENV={{env}}")
+        let before = try #require(try await store.uploadSnapshot(id: note.id)).localVersion
+        let editor = makeEditor(for: note)
+
+        editor.kind = .template
+        #expect(editor.hasUnsavedChanges)
+        await editor.save()
+
+        #expect(editor.status == .saved)
+        #expect(try await store.note(id: note.id)?.kind == .template)
+        let snapshot = try #require(try await store.uploadSnapshot(id: note.id))
+        #expect(snapshot.kind == .template)
+        #expect(snapshot.localVersion == before + 1)
+    }
+
     @Test func revertingDraftToSavedContentIsNotAnEdit() async throws {
         let note = try await store.createNote(title: "t", body: "b")
         let editor = makeEditor(for: note)

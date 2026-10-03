@@ -24,6 +24,8 @@ public enum NoteRecord {
         static let modifiedAt = "modifiedAt"
         static let conflictOf = "conflictOf"
         static let isDeleted = "isDeleted"
+        /// `EntryKind` raw value. Absent on records from builds before entry kinds.
+        static let kind = "kind"
     }
 
     /// The record name is the note's UUID. A retried upload therefore always targets the
@@ -56,6 +58,7 @@ public enum NoteRecord {
         record[Field.modifiedAt] = snapshot.modifiedAt
         record[Field.conflictOf] = snapshot.conflictOf?.uuidString
         record[Field.isDeleted] = snapshot.isDeleted ? 1 : 0
+        record[Field.kind] = snapshot.kind.rawValue
         return record
     }
 
@@ -81,6 +84,7 @@ public enum NoteRecord {
             createdAt: createdAt,
             modifiedAt: modifiedAt,
             conflictOf: (record[Field.conflictOf] as? String).flatMap(UUID.init(uuidString:)),
+            kind: EntryKind(storedValue: record[Field.kind] as? String),
             isDeleted: isDeleted,
             changeTag: record.recordChangeTag,
             systemFields: encodeSystemFields(of: record)

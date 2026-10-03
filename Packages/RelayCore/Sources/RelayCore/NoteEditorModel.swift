@@ -40,15 +40,23 @@ public final class NoteEditorModel {
         didSet { if body != oldValue { draftDidChange() } }
     }
 
+    /// Snippet or template. Changing it is an edit like any other: autosaved, uploaded.
+    public var kind: EntryKind {
+        didSet { if kind != oldValue { draftDidChange() } }
+    }
+
     public private(set) var status: SaveStatus = .saved
+
+    /// The draft as one value.
+    public var draft: NoteContent { NoteContent(title: title, body: body, kind: kind) }
+
+    /// The content last committed to disk by (or adopted into) this editor.
+    public private(set) var savedContent: NoteContent
 
     /// True when the draft differs from the last committed content.
     public var hasUnsavedChanges: Bool {
-        title != savedTitle || body != savedBody
+        draft != savedContent
     }
-
-    private var savedTitle: String
-    private var savedBody: String
 
     // Bookkeeping that no view displays, so changes to it shouldn't trigger re-renders.
     @ObservationIgnored private let store: NoteStore
@@ -69,8 +77,8 @@ public final class NoteEditorModel {
         noteID = note.id
         title = note.title
         body = note.body
-        savedTitle = note.title
-        savedBody = note.body
+        kind = note.kind
+        savedContent = note.content
         self.store = store
         self.autosaveDelay = autosaveDelay
         self.onSaved = onSaved
@@ -110,11 +118,40 @@ public final class NoteEditorModel {
     @discardableResult
     func adoptStoredContent(_ note: Note) -> Bool {
         guard !hasUnsavedChanges, status != .saving else { return false }
-        savedTitle = note.title
-        savedBody = note.body
+        savedContent = note.content
         title = note.title  // didSet sees no unsaved changes, so no autosave is scheduled.
         body = note.body
+        kind = note.kind
         return true
+    }
+
+    public enum SaveVersionOutcome: Equatable, Sendable {
+        case saved
+        /// Identical to the newest saved version, so nothing was added.
+        case unchanged
+        /// The draft couldn't be saved first, or the checkpoint failed.
+        case failed(StoreError)
+    }
+
+    /// "Save Version": commits the draft, then records the committed content as a
+    /// revision. If the draft can't be saved, no revision is made, so a revision never
+    /// claims content that isn't on disk.
+    public func saveVersion() async -> SaveVersionOutcome {
+        await save()
+        if case .failed(let error) = status { return .failed(error) }
+        do throws(StoreError) {
+            return switch try await store.saveCheckpoint(of: noteID) {
+            case .saved: .saved
+            case .unchanged: .unchanged
+            }
+        } catch {
+            return .failed(error)
+        }
+    }
+
+    /// A history model bound to this editor and its store.
+    public func makeHistory() -> RevisionHistoryModel {
+        RevisionHistoryModel(editor: self, store: store)
     }
 
     /// Cancels a scheduled autosave without saving. Used when the note is being deleted.
@@ -154,8 +191,7 @@ public final class NoteEditorModel {
         // Snapshot before suspending. While awaiting the store, the main actor is free
         // and the user may keep typing (actor reentrancy). Those newer keystrokes are not
         // part of this save; they schedule their own.
-        let title = self.title
-        let body = self.body
+        let draft = self.draft
         status = .saving
 
         do throws(StoreError) {
@@ -163,10 +199,9 @@ public final class NoteEditorModel {
             // this draft (a sync from another device) and keep that version as a
             // conflict copy instead of silently overwriting it.
             let note = try await store.updateNote(
-                id: noteID, title: title, body: body, base: (savedTitle, savedBody)
+                id: noteID, title: draft.title, body: draft.body, kind: draft.kind, base: savedContent
             )
-            savedTitle = title
-            savedBody = body
+            savedContent = draft
             status = hasUnsavedChanges ? .editing : .saved
             onSaved(note)
         } catch {

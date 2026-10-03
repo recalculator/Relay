@@ -27,6 +27,18 @@ struct RelayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     #endif
 
+    init() {
+        #if os(macOS)
+        // Relay stores commands. macOS text views would otherwise turn " into curly
+        // quotes and -- into an em dash (when "Use smart quotes and dashes" is on), which
+        // breaks a pasted command. These keys apply to this app only.
+        for key in ["NSAutomaticQuoteSubstitutionEnabled", "NSAutomaticDashSubstitutionEnabled",
+                    "NSAutomaticTextReplacementEnabled"] {
+            UserDefaults.standard.set(false, forKey: key)
+        }
+        #endif
+    }
+
     /// `@State` makes SwiftUI create these once and keep them for the app's lifetime.
     @State private var model = NotesModel()
     @State private var syncStatus = SyncStatusModel(
@@ -44,6 +56,14 @@ struct RelayApp: App {
                     #endif
                     await launch()
                 }
+        }
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("New Snippet") { Task { await model.createNote(kind: .snippet) } }
+                    .keyboardShortcut("n")
+                Button("New Template") { Task { await model.createNote(kind: .template) } }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {

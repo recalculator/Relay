@@ -1,29 +1,48 @@
 # Relay
 
-An offline-first, plain-text notes app for iOS and macOS, written in Swift and SwiftUI.
-The goal is a small app with solid non-UI engineering: durable local persistence,
-explicit iCloud sync with `CKSyncEngine`, clear concurrency, and tests aimed at data
-integrity.
+Relay is an offline-first Swift library of reusable developer commands and snippets,
+with parameterized templates, recoverable revisions, and conflict-aware syncing. It's a
+native macOS app (an iOS target exists) written in Swift and SwiftUI. The engineering
+focus is on what you can't see: durable SQLite persistence, explicit iCloud sync with
+`CKSyncEngine`, clear concurrency, and tests aimed at data integrity.
 
-> **Status: Phase 2 of 4.** Local persistence works. CloudKit sync is implemented and
-> passes tests against a **simulated** server, but **it has not yet been run against
-> real iCloud.** Builds have sync compiled out until the iCloud entitlement is
-> configured (below).
+> **Status.** Templates, revision history, and local persistence work and are tested.
+> CloudKit sync is implemented and passes tests against a **simulated** server, but
+> **it hasn't been run against real iCloud yet.** Builds have sync compiled out until
+> the iCloud entitlement is configured (below).
 
 ## Features
 
 Working and tested locally:
-- Create, edit, delete, list, and search notes. Works fully offline.
+- **Snippets and command templates.** Each entry is a Snippet or a Template, chosen
+  with a picker. Bodies are monospaced, with smart quotes and dashes off.
+- **Fill Template** (⇧⌘C on a template). Every `{{placeholder}}` gets one field, in
+  order of first appearance; a repeated placeholder shares its value. A live preview is
+  shown, and Copy is enabled once every value is filled. Malformed placeholders are
+  pointed out by line. Substitution is literal and single-pass: **Relay never runs
+  commands and doesn't shell-escape values**, and the sheet reminds you to review the
+  command. Filled-in values aren't saved.
+- **Copy** (⇧⌘C on a snippet) copies the text as is.
+- **Revision history.** Save Version (⌘S) keeps a checkpoint. History (⌘Y) lists
+  them, previews one, and shows a line diff against the current version (−/+ markers,
+  not just color). **Restore** first saves the current version as a checkpoint, then
+  makes the old one current as a normal edit that syncs. The last 50 versions per entry
+  are kept, **on this device only**.
+- Create, edit, delete, list, and search. Works fully offline.
 - SQLite storage. Every edit and its "needs upload" marker commit in one transaction.
-- Autosave 0.75 s after typing stops, plus immediate saves on note switch,
-  backgrounding, and Quit.
-- Save failures keep your text on screen with the error and Retry.
+- Autosave 0.75 s after typing stops, plus immediate saves on entry switch,
+  backgrounding, and Quit. Save failures keep your text on screen with Retry.
+
+Manually verified on macOS (2026-10-03, by the developer): create and edit, reaching
+"Saved on this device", content surviving Quit and relaunch, and characters typed
+right before ⌘Q surviving relaunch. Not yet manually verified: switching entries,
+deletion, search, templates, history. See TESTING.md.
 
 Implemented, verified only against a simulated server:
-- iCloud sync of a private-database zone with `CKSyncEngine`. Pending work and engine
-  state survive restarts.
+- iCloud sync of a private-database zone with `CKSyncEngine`, including each entry's
+  type. Pending work and engine state survive restarts.
 - Concurrent edits keep both versions: the server version plus a labeled
-  "(Conflict copy)".
+  "(Conflict copy)". A type change counts as an edit.
 - Deletions sync as tombstones. A concurrent edit always beats a delete.
 - Account separation: the iCloud account is confirmed, and checked against the account
   that owns the database, before sync starts and before each fetch and send. Once Relay
@@ -64,21 +83,23 @@ Scripts/benchmark.sh                                                            
 ## Performance
 
 Measured locally with `RelayBench` on an Apple M5 MacBook (macOS 26.5, release build,
-**Low Power Mode on**), using synthetic notes and Relay's real storage and sync code. No
-CloudKit is involved. Medians:
+schema v4, **battery power, Low Power Mode off**, 2026-10-03), using synthetic prose
+notes and Relay's real storage and sync code. No CloudKit is involved. Medians from one
+run of 3 repetitions:
 
-| | 1,000 notes | 10,000 notes |
+| | 1,000 entries | 10,000 entries |
 |---|---:|---:|
-| Save an edit (commit + pending marker) | 0.26 ms (p99 1.2 ms) | 0.47 ms (p99 2.1 ms) |
-| Reopen the store and load the notes list | 2.3 ms | 21.5 ms |
-| Search (in-memory filter, no matches) | 11 ms | 112 ms |
-| Apply 1,000 incoming changes (simulated transport) | 306 ms | 536 ms |
-| Reopen and recover 600 pending changes | 1.3 ms | 5.3 ms |
+| Save an edit (commit + pending marker) | 0.17 ms (p99 2.7 ms) | 0.41 ms (p99 4.2 ms) |
+| Reopen the store and load the list | 1.1 ms | 9.9 ms |
+| Search (in-memory filter, no matches) | 5.5 ms | 57 ms |
+| Apply 1,000 incoming changes (simulated transport) | 168 ms (one rep: 393 ms) | 407 ms |
+| Reopen and recover 600 pending changes | 0.7 ms | 2.5 ms |
 
-A notes-list index (schema v3) cut the 10,000-note load from 58 ms to 21 ms, at the
-cost of slightly slower writes. Search scales linearly with note text and is the main
-limit at large sizes. The save numbers are for a barrier sync, not a full drive-cache
-flush (see Limitations). BENCHMARKS.md has the method, every repetition, and caveats.
+A notes-list index (schema v3) cut the 10,000-entry load by about 2.7× in a controlled
+before/after comparison. Search scales linearly with total text and is the main limit
+at large sizes. The save numbers are for a barrier sync, not a full drive-cache flush
+(see Limitations). BENCHMARKS.md has the method, every repetition, the earlier Low Power
+Mode runs, and caveats.
 
 ## Enabling iCloud sync
 
@@ -113,23 +134,29 @@ Both belong in the commit.
 ```
 Relay/
 ├── Relay.xcodeproj
-├── Relay/                    SwiftUI views and app lifecycle
+├── Relay/                    SwiftUI views (list, editor, Fill Template, History) and app lifecycle
 └── Packages/RelayCore/
-    ├── Sources/RelayCore/    model, SQLite store, conflict policy, sync coordinator,
+    ├── Sources/RelayCore/    model, templates, line diff, SQLite store + history, conflict policy, sync coordinator,
     │                         CloudKit adapter (CloudKitSync.swift), UI state
     └── Tests/RelayCoreTests/ local, simulated-sync, and pure tests
 ```
 
-## Demo script (to run once sync is verified)
+## Demo script (about two minutes)
 
-1. Disconnect device 1 from the network. Create and edit a note. The status shows
-   "1 change not uploaded yet".
-2. Quit and relaunch. The note and the pending count are still there.
-3. Reconnect. The status becomes "All changes uploaded", and the note appears on
-   device 2.
-4. Take both devices offline and edit the same note differently on each. Reconnect
-   both. Both devices show the note plus a "(Conflict copy)" with the other text.
-5. Delete a note on one device. It disappears on the other.
+1. **Template.** ⇧⌘N, title "Tail logs", body
+   `kubectl -n {{namespace}} logs deploy/{{app}} --since={{window}}`. The summary lists
+   the three placeholders. Press ⇧⌘C, fill `prod`, `api`, `1h`, watch the preview, and
+   Copy. Paste into a terminal **without running it**. Point out the review reminder,
+   and that values aren't saved.
+2. **History.** Press ⌘S (Save Version). Change the body (add `--previous`, rename
+   `window`), then press ⌘Y. Show the − / + line diff, Restore, and the "Saved before a
+   restore" entry that makes the restore reversible.
+3. **Persistence.** Press ⌘Q right after typing, relaunch: the text, the template type,
+   and the history are all there.
+4. **Sync (only once verified on two real devices).** Edit on one device, appears on
+   the other; offline edit then reconnect; a concurrent edit produces a conflict copy;
+   delete propagates. Until then, say plainly that sync is verified only against a
+   simulated server.
 
 ## Limitations
 
@@ -146,6 +173,12 @@ Relay/
   ordering should keep the database consistent. Power loss hasn't been tested
   (ARCHITECTURE.md → Durability).
 - The conflict policy keeps both versions. It doesn't merge text.
+- Templates are literal text substitution. Values aren't shell-escaped and commands are
+  never run. Review generated commands before running them.
+- Revision history is local. It doesn't sync, so another device's history isn't
+  visible here. It's capped at 50 versions per entry and deleted with the entry.
+- An entry type unknown to this build (from a future version) is read as Snippet, and
+  saving it would upload it as a snippet.
 - Deleted notes leave small content-free tombstone records in iCloud indefinitely.
 - After an account switch, the previous account's database is archived on the device.
   There's no restore UI.

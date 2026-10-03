@@ -120,8 +120,8 @@ public final class NotesModel {
             .map(makeEditor(for:))
     }
 
-    public func createNote() async {
-        await createNote(title: "", body: "")
+    public func createNote(kind: EntryKind = .snippet) async {
+        await createNote(title: "", body: "", kind: kind)
     }
 
     public func deleteNote(id: UUID) async {
@@ -145,10 +145,10 @@ public final class NotesModel {
     /// the draft by saving it as a new note, so the edit is never silently lost.
     public func keepDeletedNoteDraftAsNewNote() async {
         guard let editor, editor.noteWasDeleted else { return }
-        let (title, body) = (editor.title, editor.body)
+        let draft = editor.draft
         self.editor = nil
         selectedNoteID = nil
-        await createNote(title: title, body: body)
+        await createNote(title: draft.title, body: draft.body, kind: draft.kind)
     }
 
     /// During an account mismatch: archives this database (it belongs to the other
@@ -206,10 +206,10 @@ public final class NotesModel {
 
     // MARK: Private
 
-    private func createNote(title: String, body: String) async {
+    private func createNote(title: String, body: String, kind: EntryKind) async {
         guard let store else { return }
         do throws(StoreError) {
-            let note = try await store.createNote(title: title, body: body)
+            let note = try await store.createNote(title: title, body: body, kind: kind)
             if !notes.contains(where: { $0.id == note.id }) {
                 notes.insert(note, at: 0)
             }

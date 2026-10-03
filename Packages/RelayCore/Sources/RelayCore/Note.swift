@@ -1,6 +1,7 @@
 import Foundation
 
-/// A plain-text note as the app sees it.
+/// One saved entry, a snippet or a command template, as the app sees it. (The type and
+/// table are still called "note", from before entries had kinds.)
 ///
 /// `Note` is a struct, so it has value semantics: every copy is independent. Handing a
 /// `Note` to the UI or across actors can never let one side mutate the other's copy,
@@ -15,6 +16,7 @@ public struct Note: Identifiable, Hashable, Sendable {
     public var modifiedAt: Date
     /// For a conflict copy, the id of the note it was split from. `nil` for ordinary notes.
     public var conflictOf: UUID?
+    public var kind: EntryKind
 
     public init(
         id: UUID,
@@ -22,7 +24,8 @@ public struct Note: Identifiable, Hashable, Sendable {
         body: String,
         createdAt: Date,
         modifiedAt: Date,
-        conflictOf: UUID? = nil
+        conflictOf: UUID? = nil,
+        kind: EntryKind = .snippet
     ) {
         self.id = id
         self.title = title
@@ -30,6 +33,24 @@ public struct Note: Identifiable, Hashable, Sendable {
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
         self.conflictOf = conflictOf
+        self.kind = kind
+    }
+
+    /// The user-editable content: what's compared, versioned, and restored.
+    public var content: NoteContent { NoteContent(title: title, body: body, kind: kind) }
+}
+
+/// An entry's user-editable content. A value type, so a snapshot taken before an `await`
+/// can't change underneath the code holding it.
+public struct NoteContent: Sendable, Hashable {
+    public var title: String
+    public var body: String
+    public var kind: EntryKind
+
+    public init(title: String, body: String, kind: EntryKind = .snippet) {
+        self.title = title
+        self.body = body
+        self.kind = kind
     }
 }
 
@@ -38,7 +59,7 @@ extension Note {
     public var displayTitle: String {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedTitle.isEmpty { return trimmedTitle }
-        return firstNonEmptyLine(of: body) ?? "New Note"
+        return firstNonEmptyLine(of: body) ?? (kind == .template ? "New Template" : "New Snippet")
     }
 
     /// A one-line preview of the body for list rows.

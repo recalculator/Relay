@@ -18,15 +18,14 @@ swift test --package-path Packages/RelayCore
 xcodebuild test -project Relay.xcodeproj -scheme Relay -destination 'platform=macOS'
 ```
 
-Last recorded results (2026-10-02, macOS 26.5, Xcode 26.6, Swift 6.3.3, working tree on
-top of `023c369`):
-- `swift test`: **94 tests in 16 suites passed**.
-- `xcodebuild test` (macOS): 94 tests passed.
-- Flakiness check: the 29 account-lifecycle and reentrancy tests (7 suites), which
-  interleave tasks, passed **25 of 25** consecutive runs.
+Last recorded results (2026-10-03, macOS 26.5, Xcode 26.6, Swift 6.3.3, working tree on
+top of `e79d7c1`):
+- `swift test`: **123 tests in 22 suites passed** (after both features).
 - The macOS app builds with and without `RELAY_CLOUDKIT`. Not signed, not run with
-  CloudKit.
+  CloudKit. The iOS target isn't built: the iOS platform isn't installed.
 
+2026-10-02: 94 tests in 16 suites under `swift test` and `xcodebuild test`. The 29
+account-lifecycle and reentrancy tests passed 25 of 25 consecutive runs.
 Earlier (2026-10-01): 87 tests in 14 suites, repeated 25 times.
 
 Benchmarks are separate from these tests: see BENCHMARKS.md.
@@ -107,6 +106,19 @@ Benchmarks are separate from these tests: see BENCHMARKS.md.
 | A stale account check doesn't replace the fresh database's engine | `accountResolutionInFlightIsAbandoned…` | simulated |
 | Store rejects sync writes from an ended session or another owner, inside the transaction | `writesFromAnEndedSessionOrAnotherOwnerChangeNothing` | local |
 | Notes-list query uses the v3 index (no temp B-tree sort) | `loadingTheNotesListUsesTheIndexInsteadOfSorting` | local |
+| Template grammar, repeated placeholders, malformed syntax and line, empty values, literal non-recursive substitution, Unicode and multiline | `Command templates (pure)` | pure |
+| Unknown or missing stored kind reads as snippet | `entryKindDecodesUnknownValuesAsSnippet`, `recordsFromOlderBuilds…` | pure / local CloudKit types |
+| v1 → current migration keeps content; existing rows become snippets | `v1DatabaseMigratesToCurrent…` | local |
+| CloudKit record carries `kind` and exactly the synced fields (no history) | `recordRoundTrips…`, `recordContainsExactlyTheSyncedFields` | local CloudKit types |
+| A kind change is a content change in conflicts; snippet copy ids unchanged | `aKindChangeIsAContentChange`, `conflictCopyIdentity…` | pure |
+| Kind and multiline template body sync; concurrent kind change keeps both versions | `Entry kinds through storage and simulated sync` | simulated |
+| Editor kind change saved via `updateNote`, pending with a bumped version | `changingTheKindIsSavedAndQueuedForUpload` | local |
+| Checkpoints survive restart; identical consecutive checkpoints are no-ops; 50-per-entry retention | `checkpointsSurviveRestart`, `identicalConsecutiveCheckpoints…`, `historyKeepsOnlyTheNewest…` | local |
+| **Restore keeps the current version, is a new pending edit (version never reset), uploads without a conflict** | `restoreKeepsTheCurrentVersionAndUploadsTheRestoredOne` | simulated |
+| **Injected failure during restore rolls back checkpoint, content, and pending marker** | `restoreFailureRollsBackEverything` | local |
+| Restore of a deleted entry or another entry's revision is rejected; history deleted with the entry | `restoringADeletedEntryOrAForeignRevision…` | local |
+| Save Version / History model: draft saved first, then preserved by restore | `restoreSavesTheDraftFirstAndUpdatesTheEditor` | local |
+| Line diff: identical, insertion, deletion, changed line, empty texts, trailing newline | `Line diff (pure)` | pure |
 | Conflict copies of identical content in unrelated notes stay distinct | `identicalContentConflictingInUnrelatedNotes…`, `conflictCopyIdentity…` | simulated / pure |
 | Remote deletion with unsaved draft → Keep as New Note | `draftOfNoteDeletedElsewhere…`, `cleanEditorCloses…` | local |
 | Conflict decision table; deterministic copy ids | `ConflictResolver (pure)` | pure |
@@ -166,23 +178,56 @@ it changes no observable behavior. It's kept as a one-line local guarantee.
 
 ## Manual verification
 
-### Local persistence (macOS), available now
+### Local app (macOS)
 
-1. Run the **Relay** scheme on **My Mac**. The status area says "iCloud sync isn’t
-   enabled in this build".
-2. Create a note, type, and wait for "Saved on this device". Quit with ⌘Q and relaunch;
-   the note is still there.
-3. Type, then press ⌘Q immediately. Relaunch: the text was saved (Quit waits for the
-   flush).
-4. Optional: inspect the database:
-   ```sh
-   sqlite3 ~/Library/Containers/com.ayaanchawla.Relay/Data/Library/Application\ Support/Relay/Notes.sqlite \
-     "PRAGMA user_version; SELECT id, is_deleted, local_version, synced_version FROM notes;"
-   ```
+Run the **Relay** scheme on **My Mac** (`open Relay.xcodeproj`, then ⌘R). The status
+area says "iCloud sync isn't enabled in this build". Use throwaway entries: they upload
+once iCloud is enabled.
 
-Recorded so far (manual steps 2–3 still **not performed** as of 2026-10-02): automated launches confirmed the sandboxed app starts, creates the
-database, and migrated it from v1 to v2 on 2026-10-01. Interactive steps 2–3 had **not**
-been performed by the time of writing (the database contained 0 notes).
+**Verified manually by the developer (reported 2026-10-03, on the schema v3 build
+`e79d7c1`):**
+- [x] Create an entry and edit it. The bar reaches "Saved on this device".
+- [x] Quit (⌘Q) and relaunch: the content is still there.
+- [x] Type, press ⌘Q immediately, relaunch: the last characters survived.
+
+**Not yet verified manually:**
+- [ ] Switch between two entries while typing; both keep their text.
+- [ ] Delete an entry (right-click → Delete), relaunch; it stays gone.
+- [ ] Search filters by title and body; no matches shows the empty state.
+- [ ] First launch of the v4 build migrates the existing database; earlier entries
+      appear as Snippets with their text intact.
+
+**Templates (v4 build), not yet verified:**
+- [ ] ⇧⌘N creates a Template; the picker shows Template; the body is monospaced.
+- [ ] Typing `"` and `--` in the body keeps straight quotes and two hyphens.
+- [ ] Body `ssh {{user}}@{{host}} -p {{port}}`: the summary lists user, host, port.
+- [ ] ⇧⌘C opens Fill Template with three fields in that order; Copy is disabled until
+      all three are filled; the preview updates as you type.
+- [ ] Use `{{host}}` twice: one field fills both.
+- [ ] Add `{{bad name}}`: the warning names its line; the preview keeps it literally.
+- [ ] Enter `{{port}}` as a value: the copied text contains `{{port}}` literally.
+- [ ] Copy, paste into TextEdit: it matches the preview. Close and reopen the sheet:
+      the fields are empty (values aren't kept).
+- [ ] Switch a snippet to Snippet type; ⇧⌘C copies its text directly ("Copied").
+- [ ] The template icon shows in the list; VoiceOver reads it as "Template".
+
+**History (v4 build), not yet verified:**
+- [ ] ⌘Y on a new entry shows "No Saved Versions".
+- [ ] Type, then ⌘S *without pausing*: "Version saved", and History shows the text just
+      typed. ⌘S again: "No changes since the last saved version".
+- [ ] Edit, ⌘Y: the Changes view shows − and + lines; Version shows the old text.
+- [ ] Restore → confirm: the editor shows the old text. Reopen History: the newest
+      entry says "Saved before a restore" and holds the text you replaced.
+- [ ] Quit and relaunch: history and restored content are still there.
+- [ ] Delete the entry: its history goes with it (no orphans:
+      `SELECT COUNT(*) FROM note_revisions WHERE note_id NOT IN (SELECT id FROM notes)`
+      returns 0).
+
+Optional database inspection:
+```sh
+sqlite3 ~/Library/Containers/com.ayaanchawla.Relay/Data/Library/Application\ Support/Relay/Notes.sqlite \
+  "PRAGMA user_version; SELECT id, kind, is_deleted, local_version, synced_version FROM notes;"
+```
 
 ### Real CloudKit sync (Phase 3), not yet performed
 
@@ -191,7 +236,9 @@ account. CKSyncEngine relies on push notifications, and **Simulators can't recei
 them**, so use this Mac plus an iPhone (or a second Mac). A Simulator syncs only on
 launch or via Diagnostics → Sync Now.
 
-Record the result of each step (pass/fail, date, OS versions):
+Record the result of each step (pass/fail, date, OS versions). Also confirm that an
+entry's **type** (Snippet or Template) arrives on the other device, and that its
+History does **not** (history is local by design):
 
 1. **First sync:** on device 1, create "Note A". Within a short time, it appears on
    device 2. In CloudKit Console (Development) → Private DB → zone `Notes`, the record

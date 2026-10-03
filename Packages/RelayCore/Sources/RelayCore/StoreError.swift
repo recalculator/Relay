@@ -23,6 +23,9 @@ public enum StoreError: Error, Equatable, Sendable {
     /// A sync write came from a sync session that has since ended (its engine stopped,
     /// or the database's owner changed). It was discarded without changing anything.
     case staleSyncOperation
+    /// The revision doesn't exist (pruned, or deleted with its entry) or belongs to
+    /// another entry.
+    case revisionNotFound
 }
 
 extension StoreError: LocalizedError {
@@ -44,6 +47,8 @@ extension StoreError: LocalizedError {
             "The notes database is closed."
         case .staleSyncOperation:
             "A sync change from an earlier sync session was discarded."
+        case .revisionNotFound:
+            "That version is no longer in the history."
         }
     }
 }

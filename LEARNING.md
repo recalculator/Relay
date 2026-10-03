@@ -272,3 +272,45 @@ order matches `WHERE is_deleted = 0 ORDER BY modified_at DESC, id` lets SQLite w
 index in order instead. A test checks the plan of the exact SQL `allNotes()` runs
 (`NoteStore.allNotesQuery`), so a future edit to the query or the index can't silently
 bring the sort back.
+
+# Added with templates and revision history
+
+## Pure parsing and rendering
+
+`Template(parsing:)` and `render(with:)` (`Template.swift`) take values and return
+values: no database, no clipboard, no logging, no shared state. So the tests are plain
+input → output tables (`TemplateTests.swift`), and the view (`FillTemplateView`) only
+holds the text fields' state. Rendering walks the parsed segments once and appends each
+value as text. That's why `{{x}}` inside a value can't be expanded: there's no second
+parse. `LineDiff.compare` follows the same pattern, and `ConflictResolver` already did.
+
+## Value types for content
+
+`NoteContent` (title, body, kind) is a struct. The editor's `draft`, its
+`savedContent`, a `Revision`'s content, and the `base` passed to `updateNote` are all
+copies. Comparing them is `==` (synthesized by `Hashable`), and a snapshot taken
+before an `await` can't change underneath the code holding it. `EntryKind` is an enum
+with a `String` raw value. `init(storedValue:)` turns anything unknown into
+`.snippet`, so an old CloudKit record or a future value can't make decoding fail.
+
+## Actor isolation and transactional restore
+
+`NoteStore.restore` runs on the `NoteStore` actor and contains no `await`. Inside one
+SQLite transaction it checks that the entry is live, saves the current content as a
+`before_restore` revision, and writes the restored content with
+`local_version + 1`. Actor isolation means no other store call can run in the middle,
+and the transaction means a failure undoes all three steps.
+`restoreFailureRollsBackEverything` checks this with a trigger that makes the `UPDATE`
+fail. The change notification is sent only after `COMMIT`, which is how the sync
+coordinator learns there's a new edit to upload. Restore needs no sync-specific code.
+
+## Async UI state and stale results
+
+`RevisionHistoryModel` is created from one `NoteEditorModel` (`editor.makeHistory()`)
+and stores that editor's `NoteStore`. Everything it awaits targets that entry in that
+database, even if the selection changes or an account switch replaces the store. Its
+`load()` bumps a generation counter and discards a result if a newer load started
+meanwhile: the same "anything read before an `await` is a snapshot" rule as
+`resolutionID` and `EngineLease`. `saveVersion()` and `restoreSelected()` first
+`await editor.save()`. Because saves are chained, the checkpoint or recovery revision
+always includes what was typed before the button was pressed.

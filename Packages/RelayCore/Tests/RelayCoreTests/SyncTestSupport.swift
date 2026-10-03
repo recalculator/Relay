@@ -214,6 +214,7 @@ actor FakeCloud {
             createdAt: snapshot.createdAt,
             modifiedAt: snapshot.modifiedAt,
             conflictOf: snapshot.conflictOf,
+            kind: snapshot.kind,
             isDeleted: snapshot.isDeleted,
             changeTag: tag,
             systemFields: Data(tag.utf8)

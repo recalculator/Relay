@@ -26,20 +26,26 @@ struct NoteListView: View {
         .overlay {
             if notes.isEmpty {
                 if model.searchText.isEmpty {
-                    ContentUnavailableView("No Notes", systemImage: "note.text", description: Text("Create a note to get started."))
+                    ContentUnavailableView("No Entries", systemImage: "terminal",
+                                           description: Text("Create a snippet (⌘N) or a command template (⇧⌘N)."))
                 } else {
                     ContentUnavailableView.search(text: model.searchText)
                 }
             }
         }
         .searchable(text: $model.searchText)
-        .navigationTitle("Notes")
+        .navigationTitle("Relay")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button("New Note", systemImage: "square.and.pencil") {
-                    Task { await model.createNote() }
+                // Keyboard shortcuts live in the File menu (RelayApp's commands).
+                Menu {
+                    Button("New Snippet") { Task { await model.createNote(kind: .snippet) } }
+                    Button("New Template") { Task { await model.createNote(kind: .template) } }
+                } label: {
+                    Label("New Entry", systemImage: "square.and.pencil")
+                } primaryAction: {
+                    Task { await model.createNote(kind: .snippet) }
                 }
-                .keyboardShortcut("n")
             }
         }
     }
@@ -51,6 +57,11 @@ private struct NoteRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 4) {
+                if note.kind == .template {
+                    Image(systemName: "curlybraces")
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("Template")
+                }
                 if note.conflictOf != nil {
                     Image(systemName: "arrow.triangle.branch")
                         .foregroundStyle(.orange)

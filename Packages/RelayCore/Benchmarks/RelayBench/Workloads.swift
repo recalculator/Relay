@@ -62,7 +62,9 @@ struct Workloads {
                 let body = before.body + " " + words.joined(separator: " ")
 
                 let (_, ns) = try await Measure.time {
-                    try await store.updateNote(id: note.id, title: before.title, body: body, base: before)
+                    try await store.updateNote(
+                        id: note.id, title: before.title, body: body, kind: .snippet,
+                        base: NoteContent(title: before.title, body: before.body))
                 }
                 current[note.id] = (before.title, body)
                 edited.insert(note.id)

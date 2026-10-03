@@ -8,12 +8,13 @@
 /// that has run on real data. A file whose version is newer than `currentVersion` is
 /// refused rather than opened.
 enum Schema {
-    static let currentVersion = 3
+    static let currentVersion = 4
 
     private static let migrations: [(version: Int, sql: String)] = [
         (1, v1),
         (2, v2),
         (3, v3),
+        (4, v4),
     ]
 
     static func migrate(_ db: SQLiteConnection) throws(StoreError) {
@@ -80,5 +81,37 @@ enum Schema {
     /// BENCHMARKS.md. The query and its results are unchanged.
     private static let v3 = """
         CREATE INDEX notes_live_by_modified ON notes (is_deleted, modified_at DESC, id);
+        """
+
+    /// v4: entry kinds and local revision history.
+    ///
+    /// - `kind`: `'snippet'` or `'template'` (`EntryKind`). Existing rows become snippets.
+    /// - `note_revisions`: explicit "Save Version" checkpoints, plus the automatic
+    ///   checkpoint taken before a restore. Local only; never part of a CloudKit record.
+    ///   `id` increases with each insert, so the newest revision has the highest id.
+    /// - The triggers delete an entry's history in the same transaction that deletes or
+    ///   tombstones the entry, whichever code path does it (user delete, remote
+    ///   deletion, purge after upload, zone reset).
+    private static let v4 = """
+        ALTER TABLE notes ADD COLUMN kind TEXT NOT NULL DEFAULT 'snippet';
+        CREATE TABLE note_revisions (
+            id         INTEGER PRIMARY KEY,
+            note_id    TEXT    NOT NULL,
+            created_at REAL    NOT NULL,
+            title      TEXT    NOT NULL,
+            body       TEXT    NOT NULL,
+            kind       TEXT    NOT NULL,
+            reason     TEXT    NOT NULL
+        ) STRICT;
+        CREATE INDEX note_revisions_by_note ON note_revisions (note_id, id);
+        CREATE TRIGGER note_revisions_on_delete AFTER DELETE ON notes
+        BEGIN
+            DELETE FROM note_revisions WHERE note_id = OLD.id;
+        END;
+        CREATE TRIGGER note_revisions_on_tombstone AFTER UPDATE OF is_deleted ON notes
+        WHEN NEW.is_deleted = 1
+        BEGIN
+            DELETE FROM note_revisions WHERE note_id = NEW.id;
+        END;
         """
 }

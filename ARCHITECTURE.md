@@ -26,6 +26,9 @@ hasn't yet run against real CloudKit. See TESTING.md.
 |---|---|
 | `NoteStore` (actor) | All reads and writes. The local source of truth. Applies sync decisions transactionally. |
 | `ConflictResolver` | Pure function: (local row, server version) → decision. No I/O. |
+| `Template`, `LineDiff` | Pure functions: placeholder parsing and rendering; line diffs for History. No I/O, no state. |
+| `NoteStore+History` | Local revisions: checkpoint, read, transactional restore, retention. |
+| `RevisionHistoryModel` | History sheet state for one entry, bound to that editor's store. |
 | `SyncCoordinator` (actor) | CloudKit-free sync logic: account gate, which version is in flight, routing send results and fetched changes. |
 | `CloudKitSync.swift` | The only CloudKit code: `CKRecord` mapping, `CKError` classification, `CKSyncEngineDelegate`. |
 | `SyncEngineControl` | Seam between the coordinator and the engine: add/remove pending saves, zone save, manual sync. |
@@ -46,7 +49,7 @@ hasn't yet run against real CloudKit. See TESTING.md.
 Never combine this with `NSPersistentCloudKitContainer` or SwiftData's CloudKit option
 for the same records.
 
-### Schema (v3)
+### Schema (v4)
 
 ```sql
 notes(
@@ -62,7 +65,18 @@ notes(
 ) STRICT
 sync_state(key TEXT PRIMARY KEY, value BLOB) STRICT   -- v2: engine state, bound account
 INDEX notes_live_by_modified ON notes(is_deleted, modified_at DESC, id)   -- v3
+-- v4:
+notes.kind TEXT NOT NULL DEFAULT 'snippet'          -- 'snippet' | 'template'
+note_revisions(id INTEGER PRIMARY KEY, note_id TEXT, created_at REAL,
+               title TEXT, body TEXT, kind TEXT,
+               reason TEXT) STRICT                   -- 'checkpoint' | 'before_restore'
+INDEX note_revisions_by_note ON note_revisions(note_id, id)
+TRIGGER note_revisions_on_delete    AFTER DELETE ON notes                -- history goes with
+TRIGGER note_revisions_on_tombstone AFTER UPDATE OF is_deleted ON notes  -- the entry
 ```
+
+v4 is additive. Existing rows become `snippet`, and no existing column changes
+meaning. The UI calls rows "entries"; the code and table still say "note".
 
 The v3 index matches the notes-list query (`allNotes()`). Without it, SQLite sorted
 every live row, bodies included, in a temporary B-tree on each load. The list is
@@ -176,7 +190,11 @@ never deleted or recreated.
 - Container `iCloud.com.ayaanchawla.Relay`, **private database**, custom zone `Notes`
   (created through a pending database change, which is idempotent).
 - Record type `Note`, **record name = note UUID**. Fields: `title`, `body`, `createdAt`,
-  `modifiedAt`, `conflictOf` (String?), `isDeleted` (Int64 0/1).
+  `modifiedAt`, `conflictOf` (String?), `isDeleted` (Int64 0/1), `kind` (String,
+  added with v4). A record without `kind` (from an older build) or with an unknown
+  value reads as `snippet`. Records carry only the current content: revision history
+  is never uploaded (a test checks the record's exact field set). New fields appear in
+  the Development schema on first upload; shipping would need a schema deployment.
 - Sync is compiled in only with `RELAY_CLOUDKIT`, because creating a `CKContainer`
   without the entitlement crashes.
 
@@ -240,7 +258,7 @@ the engine refetches, and re-applying is idempotent.
 | any | change tag == our base tag | **ignore** (echo of a version we already have) |
 | none | live / tombstone | insert / ignore |
 | clean | live / tombstone / gone | apply / delete / delete |
-| unsynced edit | live, same content | adopt server metadata, mark synced |
+| unsynced edit | live, same content (title, body, **and kind**) | adopt server metadata, mark synced |
 | unsynced edit | live, different content | **server version stays primary; local content saved as a conflict copy** |
 | unsynced edit | tombstone or gone | **keep local edit** (edit wins), re-based to overwrite the tombstone |
 | unsynced delete | live | **apply server edit** (edit wins; note restored) |
@@ -251,11 +269,60 @@ the engine refetches, and re-applying is idempotent.
 - **Conflict copy** title: "<title> (Conflict copy)", with `conflictOf` = original id.
   Its **id is derived from SHA-256(original id, content)**, so repeated handling of the
   same conflict upserts the same row instead of multiplying copies (tested and
-  mutation-checked).
+  mutation-checked). The kind is part of the hash only for templates, so snippet copies
+  keep the ids they had before v4. A copy keeps the kind of the content it preserves.
 - **Stale editor drafts:** the editor passes the content its draft was based on. If a
   sync replaced the note underneath an unsaved draft, `updateNote` keeps the newer
   stored version as a conflict copy in the same transaction, then writes the draft.
 - This is "keep both versions". It isn't a merge, a CRDT, or collaborative editing.
+
+## Command templates  [built]
+
+`Template` (pure value type) parses an entry's body once into segments:
+
+- literal text, or a `{{name}}` placeholder;
+- `name` is an ASCII letter or `_`, then letters, digits, or `_`; spaces inside the
+  braces are allowed;
+- anything else after `{{` is reported as malformed (with its line) and kept literally;
+- `{{{name}}}` is a literal `{` plus a placeholder.
+
+Rendering walks the segments once, so a value containing `{{x}}` is never expanded.
+It's text substitution only: no shell parsing or quoting, and nothing is executed.
+
+The Fill Template sheet keeps entered values in view `@State` only. They aren't
+persisted, synced, or logged, and neither is the clipboard. The entry's kind is an
+ordinary edit: `NoteEditorModel.kind` → `updateNote(…, kind:)` → `local_version + 1` →
+upload.
+
+## Revision history  [built; local only]
+
+- **Checkpoints, not autosaves.** Save Version first awaits the editor's save. If that
+  failed, no checkpoint is made. Then `saveCheckpoint` stores the *committed* content.
+  If it equals the entry's newest revision, nothing is added.
+- **Restore** is one transaction (`NoteStore.restore`):
+  1. checks that the entry is live (it may have been deleted meanwhile) and that the
+     revision belongs to it;
+  2. stores the current content as a `before_restore` revision;
+  3. writes the revision's title, body, and kind with `local_version + 1`.
+
+  Version counters are never reset, and server metadata (change tag, system fields)
+  isn't touched, so the upload is based on the newest server version this device knows,
+  like any edit. A failure anywhere rolls back all three steps (tested with an injected
+  failure). After the commit, the store's change stream tells the coordinator, which
+  queues the upload.
+- **Retention:** 50 revisions per entry. Older ones are pruned in the same transaction
+  that inserts a new one. History is deleted with its entry by the v4 triggers, in the
+  same transaction, whichever code path deleted it.
+- **Boundaries:** revisions live in the entry's database file. They're never part of an
+  upload, and an account switch archives them with the old database. They don't sync,
+  so another device's history isn't visible.
+- **Diff:** `LineDiff.compare` uses the standard library's `difference(from:)` on
+  lines, ordered for display (removed, then added, at each change). The UI marks lines
+  with −/+ and spoken labels, not color alone.
+- **Async UI state:** a `RevisionHistoryModel` is created per History sheet from one
+  editor, and holds that editor's store. Loads carry a generation number, so a
+  superseded load's result is dropped. Restore saves the editor's draft first, and the
+  editor then adopts the restored content.
 
 ## Deletions  [built]
 

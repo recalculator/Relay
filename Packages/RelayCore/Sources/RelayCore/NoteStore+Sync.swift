@@ -22,6 +22,7 @@ extension NoteStore {
             .init(
                 title: note.title,
                 body: note.body,
+                kind: note.kind,
                 isDeleted: isDeleted,
                 hasUnsyncedChanges: hasUnsyncedChanges,
                 baseChangeTag: changeTag
@@ -82,6 +83,7 @@ extension NoteStore {
             createdAt: row.note.createdAt,
             modifiedAt: row.note.modifiedAt,
             conflictOf: row.note.conflictOf,
+            kind: row.note.kind,
             isDeleted: row.isDeleted,
             localVersion: row.localVersion,
             baseSystemFields: row.systemFields
@@ -188,7 +190,7 @@ extension NoteStore {
                 try clearServerMetadataRow(id)
             case (.applyRemoteAndCopyLocal, .modified(let server)):
                 if let row {
-                    copyID = try insertConflictCopy(of: id, title: row.note.title, body: row.note.body)
+                    copyID = try insertConflictCopy(of: id, content: row.note.content)
                 }
                 try writeServerVersion(server, over: row)
             case (.applyRemote, .recordGone), (.adoptRemoteMetadata, .recordGone), (.applyRemoteAndCopyLocal, .recordGone):
@@ -291,11 +293,11 @@ extension NoteStore {
         ) { row throws(StoreError) in
             SyncRow(
                 note: try Self.decodeNote(row),
-                isDeleted: row.int64(6) != 0,
-                localVersion: row.int64(7),
-                syncedVersion: row.int64(8),
-                changeTag: row.string(9),
-                systemFields: row.data(10)
+                isDeleted: row.int64(7) != 0,
+                localVersion: row.int64(8),
+                syncedVersion: row.int64(9),
+                changeTag: row.string(10),
+                systemFields: row.data(11)
             )
         }.first
     }
@@ -306,19 +308,20 @@ extension NoteStore {
         if row == nil {
             let note = Note(
                 id: server.id, title: server.title, body: server.body,
-                createdAt: server.createdAt, modifiedAt: server.modifiedAt, conflictOf: server.conflictOf
+                createdAt: server.createdAt, modifiedAt: server.modifiedAt, conflictOf: server.conflictOf,
+                kind: server.kind
             )
             try insert(note, localVersion: 0)
         } else {
             try db.run(
                 """
                 UPDATE notes
-                SET title = ?, body = ?, created_at = ?, modified_at = ?, conflict_of = ?, is_deleted = 0,
+                SET title = ?, body = ?, kind = ?, created_at = ?, modified_at = ?, conflict_of = ?, is_deleted = 0,
                     synced_version = local_version
                 WHERE id = ?
                 """,
                 [
-                    .text(server.title), .text(server.body),
+                    .text(server.title), .text(server.body), .text(server.kind.rawValue),
                     .real(server.createdAt.timeIntervalSinceReferenceDate),
                     .real(server.modifiedAt.timeIntervalSinceReferenceDate),
                     server.conflictOf.map { .text($0.uuidString) } ?? .null,

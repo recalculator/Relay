@@ -15,6 +15,8 @@ public struct RemoteNote: Sendable, Equatable {
     public var createdAt: Date
     public var modifiedAt: Date
     public var conflictOf: UUID?
+    /// Missing or unrecognized on the server (an older build's record) reads as `.snippet`.
+    public var kind: EntryKind
     /// Server-side tombstone: the note was deleted. Title and body are empty.
     public var isDeleted: Bool
     /// Opaque server version identifier (`CKRecord.recordChangeTag`). It changes on every
@@ -30,6 +32,7 @@ public struct RemoteNote: Sendable, Equatable {
         createdAt: Date,
         modifiedAt: Date,
         conflictOf: UUID? = nil,
+        kind: EntryKind = .snippet,
         isDeleted: Bool = false,
         changeTag: String?,
         systemFields: Data?
@@ -40,6 +43,7 @@ public struct RemoteNote: Sendable, Equatable {
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
         self.conflictOf = conflictOf
+        self.kind = kind
         self.isDeleted = isDeleted
         self.changeTag = changeTag
         self.systemFields = systemFields
@@ -63,6 +67,7 @@ public struct UploadSnapshot: Sendable, Equatable {
     public let createdAt: Date
     public let modifiedAt: Date
     public let conflictOf: UUID?
+    public let kind: EntryKind
     public let isDeleted: Bool
     /// The `local_version` being uploaded. When the server confirms this upload, rows are
     /// marked synced only up to this version.

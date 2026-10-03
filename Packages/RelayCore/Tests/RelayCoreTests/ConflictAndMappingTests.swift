@@ -54,6 +54,20 @@ struct ConflictResolverTests {
         // Field boundaries matter: ("ab","c") is not ("a","bc").
         #expect(ConflictCopy.id(original: original, title: "ab", body: "c")
                 != ConflictCopy.id(original: original, title: "a", body: "bc"))
+        // Snippet copies keep the ids they had before kinds existed; templates differ.
+        #expect(ConflictCopy.id(original: original, title: "t", body: "body", kind: .snippet) == a)
+        #expect(ConflictCopy.id(original: original, title: "t", body: "body", kind: .template) != a)
+    }
+
+    @Test func aKindChangeIsAContentChange() {
+        let template = RemoteChange.modified(RemoteNote(
+            id: id, title: "", body: "same", createdAt: .distantPast, modifiedAt: .distantPast,
+            kind: .template, changeTag: "t2", systemFields: nil))
+        let localSnippet = Local(title: "", body: "same", kind: .snippet, isDeleted: false, hasUnsyncedChanges: true, baseChangeTag: "t1")
+        #expect(ConflictResolver.resolve(local: localSnippet, remote: template) == .applyRemoteAndCopyLocal)
+        var localTemplate = localSnippet
+        localTemplate.kind = .template
+        #expect(ConflictResolver.resolve(local: localTemplate, remote: template) == .adoptRemoteMetadata)
     }
 
     @Test func conflictCopyTitles() {
@@ -68,7 +82,7 @@ struct ConflictResolverTests {
 struct NoteRecordTests {
     let snapshot = UploadSnapshot(
         id: UUID(), title: "Title", body: "Body 👋", createdAt: Date(timeIntervalSince1970: 1_000),
-        modifiedAt: Date(timeIntervalSince1970: 2_000), conflictOf: UUID(), isDeleted: false,
+        modifiedAt: Date(timeIntervalSince1970: 2_000), conflictOf: UUID(), kind: .template, isDeleted: false,
         localVersion: 3, baseSystemFields: nil)
 
     @Test func recordRoundTripsNoteFields() throws {
@@ -84,7 +98,24 @@ struct NoteRecordTests {
         #expect(remote.createdAt == snapshot.createdAt)
         #expect(remote.modifiedAt == snapshot.modifiedAt)
         #expect(remote.conflictOf == snapshot.conflictOf)
+        #expect(remote.kind == .template)
         #expect(remote.isDeleted == false)
+    }
+
+    /// The record carries the entry's current content and nothing else: no revision
+    /// history, no local bookkeeping.
+    @Test func recordContainsExactlyTheSyncedFields() {
+        let record = NoteRecord.makeRecord(from: snapshot)
+        #expect(Set(record.allKeys()) == ["title", "body", "createdAt", "modifiedAt", "conflictOf", "isDeleted", "kind"])
+        #expect(record["kind"] as? String == "template")
+    }
+
+    @Test func recordsFromOlderBuildsOrWithUnknownKindsReadAsSnippets() throws {
+        let legacy = NoteRecord.makeRecord(from: snapshot)
+        legacy["kind"] = nil  // Builds before entry kinds never wrote the field.
+        #expect(try #require(NoteRecord.remoteNote(from: legacy)).kind == .snippet)
+        legacy["kind"] = "workflow"  // A kind this build doesn't know.
+        #expect(try #require(NoteRecord.remoteNote(from: legacy)).kind == .snippet)
     }
 
     @Test func uploadStartsFromStoredSystemFields() throws {
@@ -95,7 +126,7 @@ struct NoteRecordTests {
 
         let withBase = UploadSnapshot(
             id: snapshot.id, title: "new", body: "", createdAt: snapshot.createdAt, modifiedAt: snapshot.modifiedAt,
-            conflictOf: nil, isDeleted: true, localVersion: 4, baseSystemFields: fields)
+            conflictOf: nil, kind: .snippet, isDeleted: true, localVersion: 4, baseSystemFields: fields)
         let record = NoteRecord.makeRecord(from: withBase)
         #expect(record.recordID == original.recordID)
         #expect(record["isDeleted"] as? Int64 == 1)
@@ -105,7 +136,7 @@ struct NoteRecordTests {
     @Test func garbageSystemFieldsFallBackToAFreshRecord() {
         let withJunk = UploadSnapshot(
             id: snapshot.id, title: "t", body: "", createdAt: snapshot.createdAt, modifiedAt: snapshot.modifiedAt,
-            conflictOf: nil, isDeleted: false, localVersion: 1, baseSystemFields: Data("junk".utf8))
+            conflictOf: nil, kind: .snippet, isDeleted: false, localVersion: 1, baseSystemFields: Data("junk".utf8))
         #expect(NoteRecord.makeRecord(from: withJunk).recordID.recordName == snapshot.id.uuidString)
     }
 
@@ -168,6 +199,7 @@ struct SchemaTests {
 
         let store = try NoteStore(url: directory.storeURL)
         #expect(try await store.allNotes().map(\.title) == ["old note"])
+        #expect(try await store.allNotes().map(\.kind) == [.snippet])  // v4 default.
         #expect(try await store.pendingChanges().map(\.localVersion) == [3])
         #expect(try await store.queryIntForTesting("PRAGMA user_version") == Int64(Schema.currentVersion))
         #expect(try await store.boundAccount() == nil)  // sync_state table exists and is empty.
