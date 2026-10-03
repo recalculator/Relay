@@ -100,7 +100,62 @@ Actual generated datasets:
 | 1,000 | 1.9 MB | 301 / 1,833 / 8,170 / 47,767 chars | 23 chars |
 | 10,000 | 19.1 MB | 339 / 1,889 / 8,215 / 49,648 chars | 23 chars |
 
-## Latest run: 2026-10-03, schema v4, Low Power Mode off, battery power
+## Reference run: 2026-10-03, AC power, Low Power Mode off, clean `95b3a91`
+
+`relaybench-2026-10-03T062354Z-95b3a91.json`. **The first run with AC power and Low
+Power Mode both confirmed** (`pmset` checked immediately before: "AC Power",
+`lowpowermode 0`). One run of the unchanged suite: same harness, seed, dataset, and
+workloads as all earlier runs.
+
+| | |
+|---|---|
+| Machine | Mac17,2, Apple M5 (10 cores: 4 performance), 16 GB |
+| OS / toolchain | macOS 26.5 (25F71), Xcode 26.6 (17F113), Swift 6.3.3 |
+| Build | release (`swift build -c release`) |
+| Code | `95b3a91` (schema v4), **working tree clean** (0 changed files) |
+| Power / thermal | AC power, Low Power Mode off, thermal state nominal at start and end |
+| Durability | Relay's own settings: `journal_mode=WAL`, `synchronous=FULL`, `fullfsync=ON`, `checkpoint_fullfsync=ON`. On this system, each commit issues `F_BARRIERFSYNC`, not `F_FULLFSYNC` (see Durability). |
+| Validation | Every workload's post-run checks passed (the harness aborts on any failure) |
+
+**All numbers are local processing on one Mac. None of them is CloudKit or network
+performance.** Real iCloud sync hasn't been verified at all. The incoming-changes
+workload uses a simulated transport.
+
+| Workload | Variant | Entries | Samples | Median | p95 | p99 | Max | Per-rep medians |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| save-latency | updateNote (one transaction per edit) | 1,000 | 2,000 × 3 | 0.195 | 1.84 | 3.16 | 11.45 | 0.172, 0.148, 0.261 |
+| reopened-store | NoteStore.open | 1,000 | 10 × 3 | 0.239 | 0.332 | 0.334 | 0.334 | 0.301, 0.239, 0.217 |
+| reopened-store | NoteStore.open + allNotes() | 1,000 | 10 × 3 | 1.15 | 1.40 | 1.43 | 1.43 | 1.33, 1.15, 1.14 |
+| search | many matches “meeting” | 1,000 | 30 × 3 | 3.69 | 3.83 | 3.97 | 3.97 | 3.71, 3.65, 3.69 |
+| search | few matches “zephyrquill” | 1,000 | 30 × 3 | 5.45 | 5.73 | 6.06 | 6.06 | 5.45, 5.47, 5.42 |
+| search | no matches | 1,000 | 30 × 3 | 5.43 | 5.55 | 5.62 | 5.62 | 5.44, 5.41, 5.42 |
+| incoming-changes | SyncCoordinator.handleFetchedChanges, simulated transport | 1,000 | 1,000 × 3 | 468 | 598 | 598 | 598 | 468, 177, 598 |
+| pending-recovery | NoteStore.open + pendingChanges() after close | 1,000 | 10 × 3 | 0.809 | 1.17 | 1.17 | 1.17 | 0.778, 0.734, 1.03 |
+| save-latency | updateNote (one transaction per edit) | 10,000 | 2,000 × 3 | 0.268 | 1.96 | 3.88 | 19.27 | 0.243, 0.318, 0.247 |
+| reopened-store | NoteStore.open | 10,000 | 10 × 3 | 0.275 | 0.306 | 0.375 | 0.375 | 0.286, 0.275, 0.259 |
+| reopened-store | NoteStore.open + allNotes() | 10,000 | 10 × 3 | 9.99 | 10.35 | 10.44 | 10.44 | 10.08, 10.07, 9.94 |
+| search | many matches “meeting” | 10,000 | 30 × 3 | 35.82 | 36.86 | 37.05 | 37.05 | 35.57, 35.81, 35.93 |
+| search | few matches “zephyrquill” | 10,000 | 30 × 3 | 56.32 | 56.96 | 57.28 | 57.28 | 56.37, 56.32, 56.28 |
+| search | no matches | 10,000 | 30 × 3 | 56.25 | 56.85 | 57.65 | 57.65 | 56.10, 56.23, 56.43 |
+| incoming-changes | SyncCoordinator.handleFetchedChanges, simulated transport | 10,000 | 1,000 × 3 | 400 | 405 | 405 | 405 | 372, 400, 405 |
+| pending-recovery | NoteStore.open + pendingChanges() after close | 10,000 | 10 × 3 | 2.53 | 2.71 | 2.76 | 2.76 | 2.44, 2.58, 2.51 |
+
+Times in milliseconds. Incoming-change throughput: 1,000 entries, 1,672–5,653
+changes/s (median 2,136); 10,000 entries, 2,468–2,686 changes/s (median 2,498).
+
+**Observations (not investigated):**
+- **Incoming changes at 1,000 entries vary a lot between repetitions:** 177, 468, and
+  598 ms for identical work on identical fresh copies. Every run so far shows spread on
+  this workload. Its median isn't a stable figure; quote the range.
+- **Save latency tails** (p95 1.8–2.0 ms, p99 3.2–3.9 ms) are wider than in the Low
+  Power Mode runs on 2026-10-02 (p95 about 0.4–1.6 ms), although medians are lower. The
+  cause isn't known. Checkpoints and CPU frequency behavior are candidates, not
+  findings.
+- Compared with the 2026-10-02 runs, CPU-bound medians roughly halved (for example
+  search at 10,000 entries: 113 → 56 ms; list load: 21.5 → 10.0 ms). The schema also
+  changed since then (v3 → v4), so this isn't a controlled comparison of power modes.
+
+## Earlier run: 2026-10-03, schema v4, Low Power Mode off, **battery power**
 
 `relaybench-2026-10-03T055853Z-e79d7c1.json`. One full run, made after entry kinds and
 revision history were added.
@@ -303,7 +358,8 @@ flush**. ARCHITECTURE.md → Durability has what that means for power loss.
 
 - One machine, one OS version, warm OS file cache. The 2026-10-02 runs had Low Power
   Mode on; the 2026-10-03 run was on battery power. No run so far has had both AC power
-  and Low Power Mode off. iOS not measured.
+  and Low Power Mode off (with uncommitted v4 changes). The 2026-10-03 06:23Z run is the
+only one with AC power and Low Power Mode off. iOS not measured.
 - Synthetic, ASCII, English-word notes. Real notes (non-ASCII text, other scripts) may
   search at a different speed. The size distribution is an assumption.
 - Reopen numbers are warm-cache. True cold-disk launch time wasn't measured, because
@@ -357,4 +413,6 @@ describes this setup on that day, **not a latency guarantee**.
   - `…2026-10-02T041650Z`, `…041839Z`: schema v2, Low Power Mode **on**, AC power
     (before the v3 index)
   - `…2026-10-02T042039Z`, `…042134Z`: schema v3, Low Power Mode **on**, AC power
-  - `…2026-10-03T055853Z`: schema v4, Low Power Mode **off**, **battery** power
+  - `…2026-10-03T055853Z`: schema v4 (uncommitted), Low Power Mode **off**, **battery** power
+  - `…2026-10-03T062354Z`: schema v4 at `95b3a91` (clean), Low Power Mode **off**, **AC**
+    power (reference run)

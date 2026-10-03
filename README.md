@@ -82,24 +82,25 @@ Scripts/benchmark.sh                                                            
 
 ## Performance
 
-Measured locally with `RelayBench` on an Apple M5 MacBook (macOS 26.5, release build,
-schema v4, **battery power, Low Power Mode off**, 2026-10-03), using synthetic prose
-notes and Relay's real storage and sync code. No CloudKit is involved. Medians from one
-run of 3 repetitions:
+Local processing only: these are **not CloudKit or network numbers**, and real iCloud
+sync is unverified. Measured with `RelayBench` on an Apple M5 MacBook (macOS 26.5,
+release build, `95b3a91`, **AC power, Low Power Mode off**, 2026-10-03), using
+synthetic notes and Relay's real storage and sync code. Medians of 3 repetitions in one
+run:
 
 | | 1,000 entries | 10,000 entries |
 |---|---:|---:|
-| Save an edit (commit + pending marker) | 0.17 ms (p99 2.7 ms) | 0.41 ms (p99 4.2 ms) |
-| Reopen the store and load the list | 1.1 ms | 9.9 ms |
-| Search (in-memory filter, no matches) | 5.5 ms | 57 ms |
-| Apply 1,000 incoming changes (simulated transport) | 168 ms (one rep: 393 ms) | 407 ms |
-| Reopen and recover 600 pending changes | 0.7 ms | 2.5 ms |
+| Save an edit (commit + pending marker) | 0.20 ms (p95 1.8, p99 3.2) | 0.27 ms (p95 2.0, p99 3.9) |
+| Reopen the store and load the list | 1.2 ms | 10.0 ms |
+| Search (in-memory filter, no matches) | 5.4 ms | 56 ms |
+| Apply 1,000 incoming changes (simulated transport) | 177–598 ms (high variance) | 372–405 ms |
+| Reopen and recover 600 pending changes | 0.8 ms | 2.5 ms |
 
 A notes-list index (schema v3) cut the 10,000-entry load by about 2.7× in a controlled
 before/after comparison. Search scales linearly with total text and is the main limit
-at large sizes. The save numbers are for a barrier sync, not a full drive-cache flush
-(see Limitations). BENCHMARKS.md has the method, every repetition, the earlier Low Power
-Mode runs, and caveats.
+at large sizes. A save's flush is a barrier sync, not a full drive-cache flush (see
+Limitations). BENCHMARKS.md has the method, every repetition, all earlier runs, and
+caveats.
 
 ## Enabling iCloud sync
 
